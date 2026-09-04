@@ -1,0 +1,40 @@
+# ROM images are not distributed.  Supply your own MAME astdelux set and
+# regenerate everything with disasm/gen_from_roms.py (see disasm/README.md).
+roms/
+disasm/*_dump.bin
+disasm/*_dvgprom.bin
+
+# Atari's source archive (github.com/historicalsource/asteroids-deluxe)
+# is not distributed either; the name tables recovered from it are.  A
+# local copy here lets the naming tools regenerate them.
+asteroids-deluxe-main/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local development records, not part of the published project
+STATUS.md
+c_src/POKEY_AAE_BACKPORT.md
+docs/superpowers/
+.claude/
+
+# C conversion build output
+c_src/obj/
+*.exe
+*.obj
+*.pdb
+*.ilk
+
+# The test builds (c_src/tests) and the hosts' runtime output.  The window
+# host writes astdelux_win.ini itself with every key at its default on
+# the first run, so a local copy carries the user's own settings.
+c_src/tests/obj/
+c_src/tests/obj_*/
+c_src/tests/*.bin
+c_src/tests/*.html
+c_src/*.log
+c_src/*.nv
+c_src/*.bin
+c_src/*.html
+c_src/astdelux_win.ini
