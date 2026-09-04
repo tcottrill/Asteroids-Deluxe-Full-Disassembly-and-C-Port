@@ -140,14 +140,3 @@ model, from `pokey.cpp`) and `c_src/er2055.c` (from `er2055.cpp`). The
 names and comments recovered from Atari's source archive remain Atari's;
 the archive itself is not distributed here. Asteroids Deluxe is a
 trademark of its owner, and no ROM images are included.
-
-## Still open
-
-- A differential test against MAME: vector RAM at a known frame with
-  matching inputs and RANDOM, byte for byte.
-- Probes for the modules reviewed against the listing but not yet
-  probed: `mainline`, `nmi`, `player`, `message`, `dvg`.
-- The remaining rev 3 regions, and realigning the rev 2 names onto the
-  rev 3 listing.
-- The smaller items in
-  [`disasm/README.md#still-open`](disasm/README.md#still-open).
