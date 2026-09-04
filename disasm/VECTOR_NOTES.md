@@ -157,14 +157,6 @@ them into the display list — which is what `CPYVEC` means by *"copy and
 modify vectors"*, alongside the sign and swap masks it applies to rotate
 them. `SHIP17` is the exception and is stored lit.
 
-## What is still open here
-
-Only 7 shapes have a traced reference from the 6502 side. Most are
-reached through *computed* `JSRL` words — the ship's heading and the
-rock's orientation index into a frame set rather than naming a shape — so
-knowing *who draws what* means following that arithmetic, the way Omega
-Race's `vecxref.py` does.
-
 ## Reading further
 
 - [`astdelux2_vecrom.asm`](astdelux2_vecrom.asm) — the decoded display lists

@@ -322,17 +322,3 @@ python gen_from_roms.py ../roms --set astdelux --listings
 
 The shapes from `$4D80` up are byte-identical between the two, so vector
 art transfers directly; program-ROM findings need realigning.
-
-## Still open
-
-- Realign the rev 2 symbol names onto rev 3 by structural matching, so
-  that listing can get real names too.
-- `GAMEPLAY_NOTES.md` stops short of the collision *geometry* and the
-  saucer's aiming logic — both are named and commented in the listing but
-  have not been read closely enough to write down.
-- Shape provenance is still thin: only 7 shapes have a traced 6502
-  reference, because most are reached through computed JSRL words rather
-  than literal `LXL`/`LAH` pairs. The names are recovered, but *who draws
-  what* is largely not.
-- Extract the shapes as C data and a visual index, as the Omega Race
-  project does with `omega_shapes.c` and `shapes_preview.html`.
