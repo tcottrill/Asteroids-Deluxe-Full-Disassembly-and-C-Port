@@ -9,6 +9,9 @@
  * Backends:
  *   windows/   Win32 + OpenGL 3.3 (verbatim from the Omega Race port,
  *              with this game's inputs).  Builds astdelux_win.exe.
+ *   teensy/    the Teensy 4.1 of the Masteroids-class replica board:
+ *              DAC7811 X/Y, a 5-bit Z ladder, PT8211 audio, the cabinet
+ *              switches.  An Arduino sketch; see teensy/README.md.
  *   (headless) host_stub.c is the harness host and does not use this
  *              contract; it implements the ad_hw_* seam directly.
  */

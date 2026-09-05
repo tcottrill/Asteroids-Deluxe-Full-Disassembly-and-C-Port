@@ -91,7 +91,7 @@ test_objects.exe --probe
 | `pokey.c/.h` | the POKEY sound and RNG chip — hardware the ROM talks to, not a ROM routine; shared unchanged with the Space Duel port |
 | `er2055.c/.h` | the ER2055 EAROM behind `EACTL`/`EADAL`/`EAIN`, translated from MAME's `er2055.cpp` |
 | `app_win.c` | the Windows host's game loop: NMI pacing, POKEY cycle feed, audio push, input, EAROM persistence |
-| `platform/` | `ad_platform.h`, the host interface, and `windows/` — the OpenGL beam renderer, XAudio2 mixer, raw input, joystick, ini and logging |
+| `platform/` | `ad_platform.h`, the host interface; `windows/` — the OpenGL beam renderer, XAudio2 mixer, raw input, joystick, ini and logging; `teensy/` — the standalone Teensy 4.1 backend for the Masteroids-class replica board (DAC7811 X/Y, Z ladder, PT8211 audio), see its README |
 | `build_win_gl.bat` | the window build |
 | `tests/host_stub.c` | the headless host |
 | `tests/probe_*.c` | per-module checks, built with `tests/build_mod.bat <module>` |
