@@ -38,3 +38,8 @@ c_src/*.nv
 c_src/*.bin
 c_src/*.html
 c_src/astdelux_win.ini
+
+# The Teensy backend's sketch: stage.py copies the game core and the
+# converted samples into src/; arduino-cli --export-binaries writes build/.
+c_src/platform/teensy/astdelux_teensy/src/
+c_src/platform/teensy/astdelux_teensy/build/
