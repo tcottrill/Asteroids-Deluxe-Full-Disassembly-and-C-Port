@@ -10,5 +10,5 @@ cd /d "%~dp0"
 if not exist obj mkdir obj
 cl /nologo /W4 /std:c11 /O2 /I..\astdelux_teensy /Fo:obj\ /Fe:probe_teensy.exe ^
    probe_teensy.c ..\astdelux_teensy\vec_beam.c ..\astdelux_teensy\audio_mix.c || exit /b 1
-probe_teensy.exe
+"%~dp0probe_teensy.exe"
 endlocal
