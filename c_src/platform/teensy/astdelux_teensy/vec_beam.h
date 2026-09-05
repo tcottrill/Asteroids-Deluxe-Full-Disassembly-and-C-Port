@@ -6,6 +6,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct { int16_t x, y; } vec_pt;              /* a DAC-code position */
 typedef struct { int16_t x0, y0, x1, y1; uint8_t z; } vec_seg;  /* one lit segment, z = DVG nibble */
 
@@ -29,5 +33,9 @@ uint8_t  vec_z_pins(uint8_t code);
  * the count, 0 for a zero-length segment, never more than `max` (spacing
  * widens to fit). */
 int      vec_plan(int x0, int y0, int x1, int y1, int step, vec_pt *out, int max);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

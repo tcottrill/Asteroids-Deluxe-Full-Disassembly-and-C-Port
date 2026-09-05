@@ -18,6 +18,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void audio_mix_init(void);
 void audio_mix_set_samples(const uint8_t *const *data, const uint32_t *len, int count);
 
@@ -38,5 +42,9 @@ uint32_t audio_mix_fill(void);       /* frames waiting */
 uint32_t audio_mix_overruns(void);   /* frames dropped on push */
 uint32_t audio_mix_underruns(void);  /* frames of silence on pull */
 int      audio_mix_sample_active(int channel);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
