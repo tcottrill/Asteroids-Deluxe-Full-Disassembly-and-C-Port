@@ -30,7 +30,7 @@ extern "C" {
 /* video                                                                */
 /* ------------------------------------------------------------------ */
 
-static vec_seg  segs[VEC_MAX_SEGS];
+DMAMEM static vec_seg segs[VEC_MAX_SEGS];   /* RAM2: RAM1 is nearly full (the POKEY's 256 KB of poly tables) */
 static int      seg_n;
 static uint32_t seg_dropped;          /* beyond VEC_MAX_SEGS, counted for the status line */
 static double   last_frame_ms;

@@ -10,6 +10,15 @@
 #include "teensy_config.h"
 #include "audio_mix.h"
 
+/* On the Teensy 4 put the ring in RAM2 (the core's DMAMEM section): RAM1 is
+ * nearly full.  Not zero-initialised there, which is fine - only frames
+ * between tail and head are ever read, and both start at 0. */
+#if defined(__IMXRT1062__)
+#define RING_RAM2 __attribute__((section(".dmabuffers"), used))
+#else
+#define RING_RAM2
+#endif
+
 #define RING_MASK (AUDIO_RING_SIZE - 1)
 
 typedef struct {
@@ -19,7 +28,7 @@ typedef struct {
     uint8_t  active;
 } mix_chan;
 
-static int16_t           ring[AUDIO_RING_SIZE];
+static int16_t           ring[AUDIO_RING_SIZE] RING_RAM2;
 static volatile uint32_t head, tail;
 static volatile int      started;
 static uint32_t          overruns, underruns;
