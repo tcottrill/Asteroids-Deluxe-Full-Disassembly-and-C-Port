@@ -16,6 +16,12 @@
 
 #include "pokey.h"
 
+/* Where the tables' 17-bit sequence is when the chip's chain has
+ * settled under SKCTL reset: entries 0..8 of rand17 are all 0xFF and
+ * the chip rests at 8 (see pokey.c's "RANDOM shift chain" section and
+ * check (12) below); the 9-bit sequence rests at 0. */
+#define RESET_POS17 8
+
 static int fails;
 
 #define CHECK(cond, ...) do { \
@@ -127,10 +133,10 @@ static void check_periods(void)
  *     print(hex(rand17[(8 + (k + 1) * 64) % 0x1FFFF]))   # no XOR - MAME doesn't invert
  * -> 0x0F 0x00 0xC9 0x8C 0xC1 0xD9 0x80 0xC7 0x36 0xBD 0xCF 0x35 0x41 0x36 0x1B 0x62
  *
- * The 8 is the 17-bit chain's reset position, not 0 - see RAND17_RESET_POS
- * in pokey.h; a chip released from SKCTL reset starts counting from table
- * position 8, so a read 64 cycles after release lands at rand17[8 + 64],
- * not rand17[64].
+ * The 8 is where the chip's settled reset state sits in this sequence
+ * (RESET_POS17 above), not 0: a chip released from a full SKCTL reset
+ * continues from table position 8, so a read 64 cycles after release
+ * lands at rand17[8 + 64], not rand17[64].
  *
  * rand9 = rand_init(9)
  * for k in range(16):
@@ -170,6 +176,10 @@ static void check_random_9(void)
     ad_pokey chip;
     ad_pokey_init(&chip, 1512000, 44100);
     ad_pokey_write(&chip, W_AUDCTL, CTL_POLY9);   /* 9-bit poly */
+    ad_pokey_advance(&chip, 8);                   /* the select takes a clock to reach the
+                                                   * switch (and blanks it for one); a held
+                                                   * chain absorbs that, and a ROM's two
+                                                   * stores are at least four cycles apart */
     ad_pokey_write(&chip, W_SKCTL, 7);
     for (int k = 0; k < 16; k++) {
         ad_pokey_advance(&chip, 64);
@@ -181,31 +191,29 @@ static void check_random_9(void)
 /* ------------------------------------------------------------------ */
 /* (4) SKCTL gating RANDOM                                              */
 /* ------------------------------------------------------------------ */
-/* rand9[0] (index 0 of the rand_init sequence above, before any step
- * runs) is 0xFF: from lfsr = mask (all ones), one step only ever touches
- * bit 8, masked off by RANDOM_C's `& 0xff`, so the 9-bit generator's
- * RANDOM byte doesn't move on step 0.  The 17-bit chain is different: a
- * gate-level transcription of Atari's POKEY schematics shows it does not
- * settle at position 0 while held - it takes several of the chain's own
- * steps to reach a fixed state, and it reaches that state at table
- * position RAND17_RESET_POS (8), not 0.  Entries 0..8 of rand17 (the
- * settling steps and the position itself) are all 0xFF anyway - bit 7
- * (cleared) and bit 16 (set from the fed-back-in bit) stay outside the
- * bits-8-15 window `>> 8 & 0xff` reads for all of them - so a chip held
- * in SKCTL reset (rand_pos9 = 0, rand_pos17 = RAND17_RESET_POS, held
- * there - see read_random()'s comment) reads 0xFF from either table,
- * independent of AUDCTL's poly9/17 select, but only the 9-bit table is
- * actually sitting at its table index 0.
+/* A held chip reads 0xFF - but not from the write on.  SKCTL's init bits
+ * clear feed zeros into the head of the 9-bit register one per clock,
+ * so RANDOM (its complement) fills with ones from the top: eight clocks
+ * after the write it is 0xFF and stays there.  rand9[0] (index 0 of the
+ * rand_init sequence above) is 0xFF because from lfsr = mask (all ones)
+ * one step only ever touches bit 8, masked off by RANDOM_C's `& 0xff`;
+ * in the 17-bit sequence entries 0..8 are all 0xFF - bit 7 (cleared)
+ * and bit 16 (set from the fed-back-in bit) stay outside the bits-8-15
+ * window `>> 8 & 0xff` reads for all of them - and the chip's settled
+ * state is entry 8 (RESET_POS17), not 0.  Check (12) pins the clock-by-
+ * clock behaviour against a register-level model; this check keeps the
+ * ROM-facing contract: Tempest's init at $CD95 zeroes SKCTL and then
+ * reads RANDOM six times a few cycles apart, flagging the chip if any
+ * two differ - modelled here as the first read landing eight cycles
+ * after the write (the store to the second POKEY and the load), then
+ * LDA abs / CMP abs pairs four cycles apart.
  *
- * The rest of this check is the clock discipline MAME's SKCTL_C handler
- * and step_one_clock() give the reset: while the init bits are clear no
- * cycle moves the polynomial (Tempest's init at $CD95 zeroes SKCTL and
- * then reads RANDOM six times over a few dozen cycles, flagging the chip
- * if any two differ); machine time that passes while held is NOT charged
- * at release - counting starts from the release write, at position 8 for
- * the 17-bit chain; rewriting SKCTL with the same value is a no-op
- * (MAME: `if (data == m_SKCTL) return;`); and a write that changes other
- * bits but keeps the init bits set does not restart the sequence. */
+ * The rest is the clock discipline: rewriting SKCTL with the same value
+ * is a no-op (MAME: `if (data == m_SKCTL) return;`); a write that
+ * changes other bits but keeps the init bits set does not restart the
+ * sequence; and time spent held leaves nothing to catch up on at
+ * release, because the settled chain is a fixed point - a release after
+ * 1000 held cycles reads the same as one after 17. */
 static void check_random_skctl(void)
 {
     ad_pokey chip;
@@ -217,14 +225,15 @@ static void check_random_skctl(void)
     CHECK(first == expect17[0], "sanity: first RANDOM byte should match check (2), got %02X", first);
 
     ad_pokey_write(&chip, W_SKCTL, 0);         /* init bits clear: $CD95's reset */
+    ad_pokey_advance(&chip, 8);                /* the zeros need eight clocks to fill the register */
     for (int i = 0; i < 6; i++) {
         uint8_t v = ad_pokey_read(&chip, R_RANDOM);
-        CHECK(v == 0xFF, "held-reset read %d should be 0xFF (poly17[%d], AUDCTL=0), got %02X",
-              i, RAND17_RESET_POS, v);
+        CHECK(v == 0xFF, "held-reset read %d should be 0xFF (rand17[%d], AUDCTL=0), got %02X",
+              i, RESET_POS17, v);
         ad_pokey_advance(&chip, 4);            /* CMP abs after LDA abs: 4 cycles */
     }
 
-    ad_pokey_advance(&chip, 1000);             /* time spent held: must not count */
+    ad_pokey_advance(&chip, 1000);             /* time spent held: the chain is at rest */
     ad_pokey_write(&chip, W_SKCTL, 7);         /* release: position 8 from here */
     uint8_t v = ad_pokey_read(&chip, R_RANDOM);
     CHECK(v == rand17[8], "at release RANDOM should read entry 8, got %02X", v);
@@ -679,14 +688,33 @@ static void check_host_seam(void)
           "STIMER: a full 23-cycle period after STIMER should reach the borrow, got %d new call(s)",
           th.irq_calls - calls_before_st);
 
-    /* While SKCTL holds the chip in reset, no timer counts - see
-     * ad_pokey_advance(). */
+    /* While SKCTL holds the chip in reset only the 15/64 kHz clocks
+     * stop.  Channel 2 here is joined to a fast-clock channel 1, so its
+     * timer keeps counting through the hold; switch AUDCTL to the slow
+     * clock (which re-arms every timer) and the same timer stands still
+     * for the rest of the hold, then resumes with its phase intact at
+     * release - see timer_runs() in pokey.c. */
     ad_pokey_write(&chip, W_SKCTL, 0);
     int calls_before_held = th.irq_calls;
     ad_pokey_advance(&chip, 1000);
+    CHECK(th.irq_calls > calls_before_held,
+          "held reset: a timer on the fast clock keeps firing, got %d new call(s)",
+          th.irq_calls - calls_before_held);
+    ad_pokey_write(&chip, W_AUDCTL, 0x00);  /* channel 2 on the 64 kHz clock: AUDF2=0 -> 28 cycles */
+    calls_before_held = th.irq_calls;
+    ad_pokey_advance(&chip, 1000);
     CHECK(th.irq_calls == calls_before_held,
-          "held reset: no timer IRQ over 1000 cycles, got %d new call(s)", th.irq_calls - calls_before_held);
-    ad_pokey_write(&chip, W_SKCTL, 7);     /* release for the keyboard/serial/pot checks below */
+          "held reset: a timer on the slow clock stands still, got %d new call(s)",
+          th.irq_calls - calls_before_held);
+    ad_pokey_write(&chip, W_SKCTL, 7);     /* release: the full 28 cycles are still ahead */
+    ad_pokey_advance(&chip, 27);
+    CHECK(th.irq_calls == calls_before_held,
+          "release: the slow-clock timer resumes where it stood, no IRQ after 27 cycles, got %d new call(s)",
+          th.irq_calls - calls_before_held);
+    ad_pokey_advance(&chip, 1);
+    CHECK(th.irq_calls == calls_before_held + 1,
+          "release: the slow-clock timer's borrow lands on the 28th cycle, got %d new call(s)",
+          th.irq_calls - calls_before_held);
 
     /* --- keyboard --- */
     ad_pokey_write(&chip, W_IRQEN, IRQ_KEYBD);
@@ -761,6 +789,209 @@ static void check_host_seam(void)
     CHECK(pv == 0xFF, "pots: R_POT0+3 with no host should read 0xFF, got %02X", pv);
 }
 
+/* ------------------------------------------------------------------ */
+/* (12) The RANDOM shift chain, clock by clock                          */
+/* ------------------------------------------------------------------ */
+/* A register-level reference for the chip's RANDOM chain, written from
+ * poly_core.v of Nick Mikstas's atari_pokey (a gate-level transcription
+ * of Atari's POKEY schematics) in that file's own terms - the
+ * lfsr9bit/lfsr17bit shift registers, swDelay, the three NORs of the
+ * 9/17 switch and their delayed copies, Init - stepped one clock at a
+ * time with no shortcuts.  pokey.c's chain takes the same registers but
+ * jumps n clocks at once through GF(2) matrices whenever it is running
+ * steadily; this check is what says the jumps, the settling under Init
+ * and the select flip's transition clocks all land on the same bits as
+ * the plain clock-by-clock model, through the chip's API, for:
+ *
+ *   - a long run of advances of every size the hosts use (1..64, an NMI
+ *     period, a whole frame, and larger), 17-bit and 9-bit;
+ *   - holds of every length from 1 to 24 clocks from a running chain:
+ *     reads during the hold and for 64 clocks after release must match,
+ *     a release inside 17 clocks resumes from a mix of old and new bits
+ *     (so all but a coincidence or two differ from the settled
+ *     sequence), and one at or after 17 must equal it - the 29-cycle
+ *     hold the NMI's "WASTE TIME" loop gives this board included;
+ *   - AUDCTL's poly select flipped mid-run, both ways, read every clock
+ *     across the transition.
+ *
+ * The reference's release-after-a-settled-hold sequence is also where
+ * RESET_POS17 comes from: it is the rand17 index the reference's bytes
+ * continue from, found by searching the table. */
+typedef struct {
+    int l9[8], l17[8], swDelay, norsDelayed[3];
+} ref_chain;
+
+static void ref_step(ref_chain *s, int Init, int sel9bitPoly)
+{
+    int feedback917 = !(s->l9[5] ^ s->l9[0]);
+    int nors[3];
+    nors[0] = !(s->l17[0] | sel9bitPoly);
+    nors[1] = !(s->swDelay | !sel9bitPoly);
+    nors[2] = !(!sel9bitPoly | feedback917);
+    int swOut = !(Init | s->norsDelayed[0] | s->norsDelayed[1] | s->norsDelayed[2]);
+    for (int i = 0; i < 7; i++) { s->l9[i] = s->l9[i + 1]; s->l17[i] = s->l17[i + 1]; }
+    s->l9[7] = swOut;
+    s->l17[7] = feedback917;
+    s->swDelay = sel9bitPoly;
+    for (int i = 0; i < 3; i++) s->norsDelayed[i] = nors[i];
+}
+
+static uint8_t ref_random(const ref_chain *s)      /* rndNum = ~lfsr9bit */
+{
+    uint8_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint8_t)((!s->l9[i]) << i);
+    return v;
+}
+
+/* The chip's power-on state is a settled 17-bit hold (pokey.c's
+ * chain_reset()); start the reference the same way: from anything,
+ * hold Init for 17 clocks. */
+static void ref_reset(ref_chain *s)
+{
+    memset(s, 0, sizeof *s);
+    for (int i = 0; i < 17; i++) ref_step(s, 1, 0);
+}
+
+static void ref_advance(ref_chain *s, uint32_t n, int Init, int sel9)
+{
+    while (n--) ref_step(s, Init, sel9);
+}
+
+static void check_chain(void)
+{
+    static const uint32_t sizes[] = { 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 64, 6048, 24192, 100000, 131071, 200000 };
+    const int nsizes = (int)(sizeof sizes / sizeof sizes[0]);
+
+    /* A settled hold sits at rand17[RESET_POS17] and continues from
+     * there. */
+    {
+        const uint8_t *rand17 = ad_pokey_dbg_rand17();
+        ref_chain r; ref_reset(&r);
+        int pos = -1;
+        for (uint32_t k = 0; k < 0x1FFFF && pos < 0; k++) {
+            ref_chain t = r; uint32_t j;
+            for (j = 0; j < 32; j++) {
+                if (rand17[(k + j) % 0x1FFFF] != ref_random(&t)) break;
+                ref_step(&t, 0, 0);
+            }
+            if (j == 32) pos = (int)k;
+        }
+        CHECK(pos == RESET_POS17, "the reference's settled hold should continue from rand17[%d], found %d",
+              RESET_POS17, pos);
+    }
+
+    /* Running: every advance size, both poly selects. */
+    for (int sel = 0; sel < 2; sel++) {
+        ad_pokey chip; ref_chain r;
+        ad_pokey_init(&chip, 1512000, 44100);
+        ref_reset(&r);
+        if (sel) ad_pokey_write(&chip, W_AUDCTL, CTL_POLY9);
+        ref_advance(&r, 0, 1, sel);
+        ad_pokey_write(&chip, W_SKCTL, 7);
+        int bad = 0, total = 0;
+        for (int pass = 0; pass < 6; pass++) {
+            for (int i = 0; i < nsizes; i++) {
+                uint32_t n = sizes[i] + (uint32_t)pass;
+                ad_pokey_advance(&chip, n);
+                ref_advance(&r, n, 0, sel);
+                total++;
+                if (ad_pokey_read(&chip, R_RANDOM) != ref_random(&r)) bad++;
+            }
+        }
+        CHECK(bad == 0, "%s poly: %d of %d advances disagree with the clock-by-clock reference",
+              sel ? "9-bit" : "17-bit", bad, total);
+    }
+
+    /* Holds of 1..24 clocks from a running chain, then 64 clocks free. */
+    {
+        uint8_t settled[64];
+        {
+            ad_pokey chip;
+            ad_pokey_init(&chip, 1512000, 44100);
+            ad_pokey_write(&chip, W_SKCTL, 7);
+            for (int c = 0; c < 64; c++) { settled[c] = ad_pokey_read(&chip, R_RANDOM); ad_pokey_advance(&chip, 1); }
+        }
+        for (int sel = 0; sel < 2; sel++) {
+            int bad_hold = 0, bad_short = 0, bad_long = 0;
+            for (uint32_t h = 1; h <= 24; h++) {
+                ad_pokey chip; ref_chain r;
+                ad_pokey_init(&chip, 1512000, 44100);
+                ref_reset(&r);
+                if (sel) ad_pokey_write(&chip, W_AUDCTL, CTL_POLY9);
+                ad_pokey_write(&chip, W_SKCTL, 7);
+                ad_pokey_advance(&chip, 1000 + h * 97); ref_advance(&r, 1000 + h * 97, 0, sel);
+                ad_pokey_write(&chip, W_SKCTL, 0);
+                for (uint32_t c = 0; c < h; c++) {
+                    ad_pokey_advance(&chip, 1); ref_step(&r, 1, sel);
+                    if (ad_pokey_read(&chip, R_RANDOM) != ref_random(&r)) bad_hold++;
+                }
+                ad_pokey_write(&chip, W_SKCTL, 7);
+                bool same_as_settled = true;
+                for (int c = 0; c < 64; c++) {
+                    uint8_t v = ad_pokey_read(&chip, R_RANDOM);
+                    if (v != ref_random(&r)) bad_hold++;
+                    if (sel == 0 && v != settled[c]) same_as_settled = false;
+                    ad_pokey_advance(&chip, 1); ref_step(&r, 0, sel);
+                }
+                if (sel == 0) {
+                    if (h < 17 && same_as_settled) bad_short++;
+                    if (h >= 17 && !same_as_settled) bad_long++;
+                }
+            }
+            CHECK(bad_hold == 0, "%s poly: %d reads across holds of 1..24 clocks disagree with the reference",
+                  sel ? "9-bit" : "17-bit", bad_hold);
+            if (sel == 0) {
+                /* A release inside 17 clocks carries old bits, which can
+                 * happen to equal the settled ones for the last clock or
+                 * two (one bit left to fill); most of the sixteen must
+                 * differ, and every release at 17 or later must not. */
+                CHECK(bad_short <= 2, "%d of 16 releases inside 17 clocks continued the settled sequence; they should carry old bits",
+                      bad_short);
+                CHECK(bad_long == 0, "%d releases at 17 clocks or later differed from the settled sequence", bad_long);
+            }
+        }
+        /* The board's own hold: ldx #4 / dex / bne between the two SKCTL
+         * stores at $788F and $7899 - about 29 cycles.  A settled release. */
+        {
+            ad_pokey chip;
+            ad_pokey_init(&chip, 1512000, 44100);
+            ad_pokey_write(&chip, W_SKCTL, 7);
+            ad_pokey_advance(&chip, 5000);
+            ad_pokey_write(&chip, W_SKCTL, 0);
+            ad_pokey_advance(&chip, 29);
+            ad_pokey_write(&chip, W_SKCTL, 7);
+            bool same = true;
+            for (int c = 0; c < 64; c++) {
+                if (ad_pokey_read(&chip, R_RANDOM) != settled[c]) same = false;
+                ad_pokey_advance(&chip, 1);
+            }
+            CHECK(same, "the NMI's 29-cycle hold should release from the settled state");
+        }
+    }
+
+    /* AUDCTL's poly select flipped mid-run, read every clock across it. */
+    {
+        ad_pokey chip; ref_chain r;
+        ad_pokey_init(&chip, 1512000, 44100);
+        ref_reset(&r);
+        ad_pokey_write(&chip, W_SKCTL, 7);
+        int bad = 0;
+        int sel = 0;
+        for (int flip = 0; flip < 8; flip++) {
+            ad_pokey_advance(&chip, 777); ref_advance(&r, 777, 0, sel);
+            sel ^= 1;
+            ad_pokey_write(&chip, W_AUDCTL, sel ? CTL_POLY9 : 0);
+            for (int c = 0; c < 40; c++) {
+                ad_pokey_advance(&chip, 1); ref_step(&r, 0, sel);
+                if (ad_pokey_read(&chip, R_RANDOM) != ref_random(&r)) bad++;
+            }
+            ad_pokey_advance(&chip, 3001); ref_advance(&r, 3001, 0, sel);
+            if (ad_pokey_read(&chip, R_RANDOM) != ref_random(&r)) bad++;
+        }
+        CHECK(bad == 0, "poly select flips: %d reads disagree with the reference", bad);
+    }
+}
+
 int ad_probe(void)
 {
     check_periods();
@@ -774,6 +1005,7 @@ int ad_probe(void)
     check_tone();
     check_silence();
     check_host_seam();
+    check_chain();
 
     printf(fails ? "probe: %d failure(s)\n" : "probe: all checks passed\n", fails);
     return fails ? 2 : 0;

@@ -6,14 +6,16 @@
  * calls, Read_pokey_regs, quad-pokey, MEM callbacks) - that layer is
  * AAE's engine wiring, not chip behaviour.  The timers/IRQ/serial/
  * keyboard/pot pieces are here, driven through ad_pokey_host in place of
- * AAE's virtual PokeyHost.  The poly generators, the RANDOM register and
- * the SKCTL reset semantics follow MAME's pokey.cpp (0.286,
+ * AAE's virtual PokeyHost.  The audio poly tables and the SKCTL hold on
+ * the audio side follow MAME's pokey.cpp (0.286,
  * src/devices/sound/pokey.cpp) - credit to the MAME team for the LFSR
- * arithmetic and the reset model.  The pot scanner follows the Altirra
- * Hardware Reference (Avery Lee), which measured the real chip; the
- * 17-bit RNG chain's reset position (RAND17_RESET_POS) follows a gate-
- * level transcription of Atari's schematics (Nick Mikstas's atari_pokey)
- * - see pokey.h.  Where a comment below says "as AAE" or "as the
+ * arithmetic.  The pot scanner follows the Altirra Hardware Reference
+ * (Avery Lee), which measured the real chip.  The RANDOM shift chain -
+ * its registers, what SKCTL's init bits do to it clock by clock, and
+ * which timers keep counting while it is held - follows a gate-level
+ * transcription of Atari's schematics (Nick Mikstas's atari_pokey,
+ * poly_core.v, clock_gen_core.v, freq_control.v) - see pokey.h's
+ * ad_rng_chain.  Where a comment below says "as AAE" or "as the
  * original" it means the algorithm is copied verbatim; only the C++
  * class's `this->member` becomes `p->member`, and PokeyHost's virtual
  * calls become ad_pokey_host's optional function-pointer calls (or a
@@ -43,27 +45,38 @@
  * feedback on bits 2 and size-1, seeded from 0.  poly9/17 feed bit0 XOR
  * bit5 back into bit8 (9-bit), seeded from all ones; the 17-bit case is
  * that 9-bit LFSR extended by an 8-bit shift register, folding bit8 XOR
- * bit13 back into bit7 of the low byte.  One pass over the states writes
- * both slices of each: g_polyN gets the audio toggle bit (`& 1`),
- * g_randN gets the RANDOM-register byte (`& 0xff` for 9-bit,
- * `>> 8 & 0xff` for 17-bit).
+ * bit13 back into bit7 of the low byte.  The render indexes g_polyN for
+ * the audio toggle bit (`& 1`).  RANDOM does not use a table: it reads
+ * the shift chain itself (the "RANDOM shift chain" section below) - the
+ * g_randN slices (`& 0xff` for 9-bit, `>> 8 & 0xff` for 17-bit) are
+ * built only for the probe, which checks the chain against them.
  *
  * These are `static`, not `const`, and built at runtime rather than
  * typed in - the one deliberate exception to "no globals besides g and
  * const tables" (CONVENTIONS.md rule 10).  On a microcontroller too
  * small for a 128 KB runtime table, the alternative is either a
  * flash-resident `const` table (computed once, offline, by this same
- * arithmetic) or stepping the LFSR live in read_random()/render()
- * instead of precomputing it - either avoids the RAM cost; this port
- * takes the table because the Windows/headless hosts have RAM to
- * spare. */
+ * arithmetic) or stepping the LFSR live in render() instead of
+ * precomputing it - either avoids the RAM cost; this port takes the
+ * table because the Windows/headless hosts have RAM to spare. */
 static uint8_t g_poly4[15];
 static uint8_t g_poly5[31];
 static uint8_t g_poly9[511];
 static uint8_t g_poly17[131071];
+#ifdef AD_PROBE
 static uint8_t g_rand9[511];
 static uint8_t g_rand17[131071];
+#endif
 static bool    g_tables_built = false;
+
+/* Jump tables for the RANDOM shift chain: for each poly select (index
+ * 0 = 17-bit, 1 = 9-bit) the chain's one-clock transition as a 17x17
+ * matrix over GF(2), raised to every power of two up to 2^31, so that
+ * ad_pokey_advance() can clock the chain n times in O(popcount(n)).
+ * Row r is the mask of chain bits that feed bit r; a step is seventeen
+ * AND-and-parity operations.  Built by build_tables(). */
+#define CHAIN_BITS 17
+static uint32_t g_jump[2][32][CHAIN_BITS];
 
 /* Fibonacci LFSR: each step folds bits 2 and (size-1) of the running
  * state through XNOR into a new bit shifted in at position 0; only the
@@ -83,29 +96,204 @@ static void poly_init_4_5(uint8_t *poly, int size)
 }
 
 /* Writes both slices of each state in the same pass (see the table
- * comment above): g_polyN gets the toggle bit, g_randN gets the RANDOM
- * byte.  Seeded from lfsr = mask (all ones), not 0, which is what makes
- * a chip held in SKCTL reset read 0xFF (see read_random() below). */
+ * comment above): g_polyN gets the toggle bit, g_randN (probe builds
+ * only; NULL otherwise) gets the RANDOM byte.  Seeded from lfsr = mask
+ * (all ones): in this register's polarity that is the complement of the
+ * chip's all-zero 9-bit register, so the tables line up with the chain
+ * (see chain_to_vec()). */
 static void poly_init_9_17(uint8_t *poly, uint8_t *rnd, int size)
 {
     uint32_t mask = (size == 17) ? 0x1FFFFu : 0x1FFu;
     uint32_t lfsr = mask;
     for (uint32_t i = 0; i < mask; ++i) {
+        uint8_t byte;
         if (size == 17) {
             uint32_t in8 = ((lfsr >> 8) & 1u) ^ ((lfsr >> 13) & 1u);
             uint32_t in  = lfsr & 1u;
             lfsr >>= 1;
             lfsr = (lfsr & 0xFF7Fu) | (in8 << 7);
             lfsr = (in << 16) | lfsr;
-            rnd[i] = (uint8_t)((lfsr >> 8) & 0xFFu);
+            byte = (uint8_t)((lfsr >> 8) & 0xFFu);
         } else {
             uint32_t in = (lfsr & 1u) ^ ((lfsr >> 5) & 1u);
             lfsr >>= 1;
             lfsr = (in << 8) | lfsr;
-            rnd[i] = (uint8_t)(lfsr & 0xFFu);
+            byte = (uint8_t)(lfsr & 0xFFu);
         }
+        if (rnd)
+            rnd[i] = byte;
         poly[i] = (uint8_t)(lfsr & 1u);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* RANDOM shift chain                                                  */
+/* ------------------------------------------------------------------ */
+/* The chip's 9/17-bit polynomial, register for register from
+ * poly_core.v (see ad_rng_chain in pokey.h for the register names).
+ * Hardware polarity: the 9-bit register's bits are the complement of
+ * the RANDOM byte, the XNOR of its bits 5 and 0 feeds the 17-bit
+ * extension, and the head of the 9-bit register takes the NOR of the
+ * three registered switch outputs - or a zero while the SKCTL init
+ * bits are clear (Init).  With the 17-bit poly selected the switch
+ * routes bit 0 of the extension round to the head (17 stages counting
+ * the switch's own flop); with the 9-bit poly it routes the XNOR
+ * straight round (9 stages), and the extension keeps shifting unseen.
+ * The clock never stops: Init and the select only change the feeds.
+ *
+ * Holding Init shifts a zero into the head every clock.  After eight
+ * the 9-bit register is clear (RANDOM 0xFF), from the ninth the XNOR of
+ * two zeros feeds ones into the extension, and after seventeen the
+ * whole chain is at rest: it stays there for as long as the hold lasts,
+ * and a release inside those seventeen clocks resumes from whatever mix
+ * of old and new bits the chain holds at that moment.  The one-clock
+ * blank when the select flips (nors[1]) and the clock's delay on the
+ * select (swDelay) are in here too, so flipping AUDCTL's poly bit
+ * mid-run does what the chip does. */
+
+/* One clock of the chain: the negedge always block of poly_core.v. */
+static void chain_step(ad_rng_chain *c, bool init, bool sel9)
+{
+    uint32_t fb917 = (((c->l9 >> 5) ^ c->l9) & 1u) ^ 1u;        /* ~(l9[5] ^ l9[0]) */
+    uint32_t nors0 = ((c->l17 & 1u) | (uint32_t)sel9) ^ 1u;     /* ~(l17[0] | sel9) */
+    uint32_t nors1 = ((uint32_t)c->swdelay | (uint32_t)!sel9) ^ 1u; /* ~(swDelay | ~sel9) */
+    uint32_t nors2 = ((uint32_t)!sel9 | fb917) ^ 1u;            /* ~(~sel9 | fb917) */
+    uint32_t swout = ((uint32_t)init | (uint32_t)(c->nd != 0)) ^ 1u; /* ~(Init | nD[0..2]) */
+    c->l9      = (uint8_t)((c->l9 >> 1) | (swout << 7));
+    c->l17     = (uint8_t)((c->l17 >> 1) | (fb917 << 7));
+    c->swdelay = (uint8_t)sel9;
+    c->nd      = (uint8_t)(nors0 | (nors1 << 1) | (nors2 << 2));
+}
+
+/* The state a held chain settles in (and never leaves while held):
+ * 9-bit register clear, extension all ones, every switch output low,
+ * the select delay caught up. */
+static bool chain_settled(const ad_rng_chain *c, bool sel9)
+{
+    return c->l9 == 0 && c->l17 == 0xFF && c->nd == 0 && c->swdelay == (uint8_t)sel9;
+}
+
+/* Running steadily: not held, the select delay caught up, and only the
+ * selected path's switch output live.  Then the next clock is a linear
+ * function of the seventeen bits chain_to_vec() packs, and the jump
+ * tables apply; otherwise (the two clocks after a select flip) it is
+ * stepped one clock at a time. */
+static bool chain_steady(const ad_rng_chain *c, bool sel9)
+{
+    return c->swdelay == (uint8_t)sel9 && (c->nd & 2u) == 0 &&
+           (c->nd & (sel9 ? 1u : 4u)) == 0;
+}
+
+/* The steady chain as a 17-bit vector in the tables' polarity (every
+ * bit complemented): bits 15..8 the 9-bit register (RANDOM as read),
+ * bits 7..0 the extension, bit 16 the complement of what the switch
+ * will feed the head next clock.  This is exactly the register layout
+ * poly_init_9_17() steps for the 17-bit poly, and its 9-bit poly is
+ * bits 16..8 of the same vector - which is why the probe's table
+ * positions and the chain agree. */
+static uint32_t chain_to_vec(const ad_rng_chain *c)
+{
+    uint32_t swout_next = (uint32_t)(c->nd == 0);
+    return ((uint32_t)(uint8_t)~c->l9 << 8) | (uint32_t)(uint8_t)~c->l17 |
+           ((swout_next ^ 1u) << 16);
+}
+
+static void vec_to_chain(ad_rng_chain *c, uint32_t v, bool sel9)
+{
+    uint32_t nswout = (v >> 16) & 1u;
+    c->l9      = (uint8_t)~(v >> 8);
+    c->l17     = (uint8_t)~v;
+    c->swdelay = (uint8_t)sel9;
+    c->nd      = (uint8_t)(sel9 ? nswout << 2 : nswout);
+}
+
+/* One clock on the vector (chain_step() in the tables' polarity, steady
+ * state only): shift right; the head (bit 15) takes bit 16; the
+ * extension's head (bit 7) takes bit 8 XOR bit 13; bit 16 takes bit 0
+ * for the 17-bit poly, bit 8 XOR bit 13 for the 9-bit one. */
+static uint32_t chain_step_vec(uint32_t v, bool sel9)
+{
+    uint32_t t = ((v >> 8) ^ (v >> 13)) & 1u;
+    uint32_t nv = (v >> 1) & 0x7F7Fu;
+    nv |= ((v >> 16) & 1u) << 15;
+    nv |= t << 7;
+    nv |= (sel9 ? t : (v & 1u)) << 16;
+    return nv;
+}
+
+static uint32_t parity17(uint32_t x)
+{
+    x ^= x >> 16; x ^= x >> 8; x ^= x >> 4; x ^= x >> 2; x ^= x >> 1;
+    return x & 1u;
+}
+
+static uint32_t vec_apply(const uint32_t *m, uint32_t v)
+{
+    uint32_t out = 0;
+    for (int r = 0; r < CHAIN_BITS; ++r)
+        out |= parity17(m[r] & v) << r;
+    return out;
+}
+
+/* g_jump[sel9][0] from chain_step_vec() a unit vector at a time, then
+ * each power of two as the square of the one before (row r of A*A is
+ * the XOR of A's rows named by row r of A). */
+static void build_jump(bool sel9)
+{
+    uint32_t (*m)[CHAIN_BITS] = g_jump[sel9];
+    for (int r = 0; r < CHAIN_BITS; ++r)
+        m[0][r] = 0;
+    for (int b = 0; b < CHAIN_BITS; ++b) {
+        uint32_t out = chain_step_vec(1u << b, sel9);
+        for (int r = 0; r < CHAIN_BITS; ++r)
+            if ((out >> r) & 1u)
+                m[0][r] |= 1u << b;
+    }
+    for (int k = 1; k < 32; ++k) {
+        for (int r = 0; r < CHAIN_BITS; ++r) {
+            uint32_t row = 0;
+            for (int b = 0; b < CHAIN_BITS; ++b)
+                if ((m[k - 1][r] >> b) & 1u)
+                    row ^= m[k - 1][b];
+            m[k][r] = row;
+        }
+    }
+}
+
+/* Clock the chain n times.  Held: one clock at a time until it settles
+ * (at most seventeen), then nothing - the settled state is a fixed
+ * point.  Running: one clock at a time through a select flip's two
+ * transition clocks, then the jump tables for the rest. */
+static void chain_advance(ad_rng_chain *c, uint32_t n, bool init, bool sel9)
+{
+    while (n) {
+        if (init) {
+            if (chain_settled(c, sel9))
+                return;
+            chain_step(c, true, sel9);
+            --n;
+            continue;
+        }
+        if (!chain_steady(c, sel9)) {
+            chain_step(c, false, sel9);
+            --n;
+            continue;
+        }
+        uint32_t v = chain_to_vec(c);
+        for (int k = 0; k < 32; ++k)
+            if ((n >> k) & 1u)
+                v = vec_apply(g_jump[sel9][k], v);
+        vec_to_chain(c, v, sel9);
+        return;
+    }
+}
+
+/* The chain as ad_pokey_reset() leaves it: at rest under a long hold
+ * with the 17-bit poly selected (AUDCTL = 0), the state a chip that has
+ * seen SKCTL = 0 for seventeen clocks is in. */
+static void chain_reset(ad_rng_chain *c)
+{
+    c->l9 = 0; c->l17 = 0xFF; c->swdelay = 0; c->nd = 0;
 }
 
 static void build_tables(void)
@@ -114,8 +302,15 @@ static void build_tables(void)
         return;
     poly_init_4_5(g_poly4, 4);
     poly_init_4_5(g_poly5, 5);
+#ifdef AD_PROBE
     poly_init_9_17(g_poly9, g_rand9, 9);
     poly_init_9_17(g_poly17, g_rand17, 17);
+#else
+    poly_init_9_17(g_poly9, NULL, 9);
+    poly_init_9_17(g_poly17, NULL, 17);
+#endif
+    build_jump(false);
+    build_jump(true);
     g_tables_built = true;
 }
 
@@ -184,6 +379,23 @@ static int timer_channel(int which)
 static uint8_t timer_irq_bit(int which)
 {
     return which == 0 ? IRQ_TIMR1 : which == 1 ? IRQ_TIMR2 : IRQ_TIMR4;
+}
+
+/* Does timer w count this slice?  Always while the chip runs.  Held
+ * (SKCTL init bits clear), the 15 kHz and 64 kHz clocks stop but the
+ * 1.79 MHz one does not (clock_gen_core.v holds its two clock LFSRs on
+ * Init; freq_control.v's carry for channels 1 and 3 is the fast-clock
+ * enable OR the slow clock), so a channel on the fast clock - and the
+ * joined partner it clocks - keeps counting. */
+static bool timer_runs(const ad_pokey *p, int which)
+{
+    if (p->rng_enabled)
+        return true;
+    switch (which) {
+    case 0:  return (p->AUDCTL & CTL_CH1_HICLK) != 0;
+    case 1:  return (p->AUDCTL & (CTL_CH12_JOIN | CTL_CH1_HICLK)) == (CTL_CH12_JOIN | CTL_CH1_HICLK);
+    default: return (p->AUDCTL & (CTL_CH34_JOIN | CTL_CH3_HICLK)) == (CTL_CH34_JOIN | CTL_CH3_HICLK);
+    }
 }
 
 /* Latch a fired IRQ into IRQST and tell the host, if either is wired up
@@ -260,8 +472,7 @@ void ad_pokey_reset(ad_pokey *p)
     p->pot_scan_ever = false;
     p->pot_scan_start = 0;
     p->rng_enabled = 0;
-    p->rand_pos9 = 0;
-    p->rand_pos17 = RAND17_RESET_POS;
+    chain_reset(&p->rng);
     /* Each timer starts a full period away; divisor[i] was just seeded
      * to base_clock above (the same "sane before any write" fallback
      * the divisors themselves use). */
@@ -296,37 +507,39 @@ void ad_pokey_set_host(ad_pokey *p, const ad_pokey_host *h)
     p->host = h;
 }
 
-/* Machine time: n POKEY clocks at once.  The polynomial counters and the
- * three hardware timers only move while SKCTL's init bits are set.  See
- * pokey.h's time-model note for who calls this and with what. */
+/* Machine time: n POKEY clocks at once.  The RANDOM chain clocks every
+ * cycle, held or not (what it takes in differs); the three hardware
+ * timers count while the chip runs, and while held only on the fast
+ * clock (timer_runs()).  See pokey.h's time-model note for who calls
+ * this and with what. */
 void ad_pokey_advance(ad_pokey *p, uint32_t cycles)
 {
     p->cycles += cycles;
-    if (p->rng_enabled) {
-        p->rand_pos9 = (uint32_t)(((uint64_t)p->rand_pos9 + cycles) % 0x1FFu);
-        p->rand_pos17 = (uint32_t)(((uint64_t)p->rand_pos17 + cycles) % 0x1FFFFu);
+    build_tables();
+    chain_advance(&p->rng, cycles, !p->rng_enabled, (p->AUDCTL & CTL_POLY9) != 0);
 
-        /* Each timer counts down tcnt[w] POKEY cycles to a borrow.  If
-         * this slice reaches or passes it, the borrow fired - one or
-         * more times, if the slice spans several periods, but IRQST is
-         * a latch so only one fire_irq() is needed per slice regardless
-         * of how many.  n is how many additional periods it takes for
-         * tcnt[w] to land past cycles; adding n periods first and then
-         * subtracting the slice leaves tcnt[w] holding the correct
-         * remaining distance to the *next* borrow, with phase intact
-         * (see pokey.h's timer paragraph).  channel_period() (behind
-         * divisor[]) never returns 0, so this never divides by zero. */
-        for (int w = 0; w < 3; ++w) {
-            uint32_t divisor = p->divisor[timer_channel(w)];
-            if (cycles >= p->tcnt[w]) {
-                uint32_t n = (cycles - p->tcnt[w]) / divisor + 1;
-                p->tcnt[w] += n * divisor;
-                uint8_t bit = timer_irq_bit(w);
-                if (p->IRQEN & bit)
-                    fire_irq(p, bit);
-            }
-            p->tcnt[w] -= cycles;
+    /* Each timer counts down tcnt[w] POKEY cycles to a borrow.  If this
+     * slice reaches or passes it, the borrow fired - one or more times,
+     * if the slice spans several periods, but IRQST is a latch so only
+     * one fire_irq() is needed per slice regardless of how many.  n is
+     * how many additional periods it takes for tcnt[w] to land past
+     * cycles; adding n periods first and then subtracting the slice
+     * leaves tcnt[w] holding the correct remaining distance to the
+     * *next* borrow, with phase intact (see pokey.h's timer paragraph).
+     * channel_period() (behind divisor[]) never returns 0, so this never
+     * divides by zero. */
+    for (int w = 0; w < 3; ++w) {
+        if (!timer_runs(p, w))
+            continue;
+        uint32_t divisor = p->divisor[timer_channel(w)];
+        if (cycles >= p->tcnt[w]) {
+            uint32_t n = (cycles - p->tcnt[w]) / divisor + 1;
+            p->tcnt[w] += n * divisor;
+            uint8_t bit = timer_irq_bit(w);
+            if (p->IRQEN & bit)
+                fire_irq(p, bit);
         }
+        p->tcnt[w] -= cycles;
     }
 }
 
@@ -392,28 +605,22 @@ void ad_pokey_write(ad_pokey *p, uint8_t reg, uint8_t v)
         break;
 
     case W_SKCTL:
-        /* A rewrite of the current value is a no-op.  Entering reset
-         * (init bits clear) zeroes the polynomial positions, which
-         * ad_pokey_advance() then holds there until a write sets the
-         * init bits again; release changes nothing but the gate, so
-         * counting starts from position RAND17_RESET_POS/0 at that
-         * write.  The chip has one set of shift registers, so the
-         * render's poly phases (p4..p17, plus the ticks pending in
-         * poly_adjust) restart from the seed too, and ad_pokey_render()
-         * holds still until release.  The hardware timers hold the same
-         * way (see ad_pokey_advance()), but keep whatever phase they had
-         * when reset was entered - only AUDF/AUDCTL/STIMER writes rearm
-         * them, same as a real POKEY's timers, which don't reset on
-         * SKCTL. */
+        /* A rewrite of the current value is a no-op.  The init bits
+         * only change what the RANDOM chain takes in from the next
+         * clock on (see chain_advance()): nothing is cleared here, the
+         * clocks that follow do the clearing, and a release changes
+         * nothing but the feed.  The render's poly phases (p4..p17,
+         * plus the ticks pending in poly_adjust) restart from the seed
+         * on entering reset, and ad_pokey_render() holds still until
+         * release.  The hardware timers keep their phase either way -
+         * only AUDF/AUDCTL/STIMER writes rearm them - and the slow-clock
+         * ones stand still while held (see timer_runs()). */
         if (v == p->SKCTL)
             break;
         p->SKCTL = v;
         p->rng_enabled = (v & SK_INIT) != 0;
-        if (!p->rng_enabled) {
-            p->rand_pos9 = 0;
-            p->rand_pos17 = RAND17_RESET_POS;
+        if (!p->rng_enabled)
             p->p4 = p->p5 = p->p9 = p->p17 = p->poly_adjust = 0;
-        }
         break;
 
     case W_POTGO:
@@ -451,30 +658,19 @@ void ad_pokey_write(ad_pokey *p, uint8_t reg, uint8_t v)
 /* Reads                                                               */
 /* ------------------------------------------------------------------ */
 
-/* RANDOM: the byte at the current polynomial position, uninverted,
- * which only ad_pokey_advance() moves (see pokey.h's time-model note).
- * The read charges nothing, so a caller that knows the 6502 cycle
- * distance to its previous read advances by exactly that first, and
- * back-to-back reads with no machine time between them return the same
- * byte.
- *
- * With SKCTL held in reset the positions sit fixed and RANDOM reads that
- * table entry - not a special case, just where the LFSR chain settles
- * while held.  The 9-bit chain sits at entry 0: with the all-ones seed,
- * the first step only clears the top bit its generator feeds back in
- * (bit 8, outside RANDOM's `& 0xff` window), so entry 0 of g_rand9 is
- * 0xFF.  The 17-bit chain does not settle at entry 0 - a gate-level
- * transcription of Atari's POKEY schematics shows it parked at
- * RAND17_RESET_POS (8) instead, one clock later at 9, and so on; that
- * settling takes several of the shift chain's own steps, which is why
- * entries 0..8 of g_rand17, not just entry 0, are all 0xFF (see
- * RAND17_RESET_POS's comment in pokey.h).  So a held-reset chip reads
- * 0xFF either way, but for different reasons on each poly select, and
- * release starts the 17-bit chain from table position 8, not 0. */
-static uint8_t read_random(ad_pokey *p)
+/* RANDOM: the complement of the chain's 9-bit register (poly_core.v's
+ * rndNum = ~lfsr9bit), which only ad_pokey_advance() moves (see
+ * pokey.h's time-model note).  The read charges nothing, so a caller
+ * that knows the 6502 cycle distance to its previous read advances by
+ * exactly that first, and back-to-back reads with no machine time
+ * between them return the same byte.  Whichever poly AUDCTL selects,
+ * the byte comes from the same eight flops; the select only changes
+ * what feeds them.  A chip held in reset reads 0xFF once eight clocks
+ * of zeros have shifted in, and before that the tail of what it was
+ * doing. */
+static uint8_t read_random(const ad_pokey *p)
 {
-    build_tables();
-    return (p->AUDCTL & CTL_POLY9) ? g_rand9[p->rand_pos9] : g_rand17[p->rand_pos17];
+    return (uint8_t)~p->rng.l9;
 }
 
 /* ALLPOT.  POKEY pot scanner, time-based like the real chip: each
