@@ -1,5 +1,5 @@
-/* plat_teensy.cpp - the Teensy 4.1 backend for the Masteroids-class replica
- * board: everything in ad_platform.h that vec_out.cpp (video) and
+/* plat_teensy.cpp - the Teensy 4.1 backend for the Teensy Vector Emulation
+ * PCB: everything in ad_platform.h that vec_out.cpp (video) and
  * audio_out.cpp (audio) do not cover.
  *
  *  - video sink: dvg.c's segments are mapped to DAC codes as they arrive

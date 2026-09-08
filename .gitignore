@@ -19,6 +19,18 @@ c_src/POKEY_AAE_BACKPORT.md
 docs/superpowers/
 .claude/
 
+# The Teensy Vector Emulation PCB's design files (KiCad project,
+# schematics, layout, design notes) live outside this repo and are not
+# published; these patterns keep a stray copy out.
+*.kicad_*
+*.kicad_pro
+*.sch
+fp-info-cache
+*[Mm]asteroids*
+
+# Reference material dropped into the tree for study, not distributed
+atari_pokey-main/
+
 # C conversion build output
 c_src/obj/
 *.exe
