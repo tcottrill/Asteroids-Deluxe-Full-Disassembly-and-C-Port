@@ -124,8 +124,13 @@ static void check_periods(void)
  *
  * rand17 = rand_init(17)
  * for k in range(16):
- *     print(hex(rand17[(k + 1) * 64 % 0x1FFFF]))   # no XOR - MAME doesn't invert
- * -> 0xF8 0x82 0x2D 0x18 0x71 0xEA 0xE9 0x4C 0x2C 0xF4 0x79 0x97 0x05 0x4A 0x5D 0xD0
+ *     print(hex(rand17[(8 + (k + 1) * 64) % 0x1FFFF]))   # no XOR - MAME doesn't invert
+ * -> 0x0F 0x00 0xC9 0x8C 0xC1 0xD9 0x80 0xC7 0x36 0xBD 0xCF 0x35 0x41 0x36 0x1B 0x62
+ *
+ * The 8 is the 17-bit chain's reset position, not 0 - see RAND17_RESET_POS
+ * in pokey.h; a chip released from SKCTL reset starts counting from table
+ * position 8, so a read 64 cycles after release lands at rand17[8 + 64],
+ * not rand17[64].
  *
  * rand9 = rand_init(9)
  * for k in range(16):
@@ -140,8 +145,8 @@ static void check_periods(void)
  * so the spacing is fed explicitly here with ad_pokey_advance().
  */
 static const uint8_t expect17[16] = {
-    0xF8, 0x82, 0x2D, 0x18, 0x71, 0xEA, 0xE9, 0x4C,
-    0x2C, 0xF4, 0x79, 0x97, 0x05, 0x4A, 0x5D, 0xD0
+    0x0F, 0x00, 0xC9, 0x8C, 0xC1, 0xD9, 0x80, 0xC7,
+    0x36, 0xBD, 0xCF, 0x35, 0x41, 0x36, 0x1B, 0x62
 };
 static const uint8_t expect9[16] = {
     0x75, 0xAA, 0xB3, 0x98, 0x45, 0x20, 0xF3, 0x7F,
@@ -176,26 +181,31 @@ static void check_random_9(void)
 /* ------------------------------------------------------------------ */
 /* (4) SKCTL gating RANDOM                                              */
 /* ------------------------------------------------------------------ */
-/* rand9[0] and rand17[0] (index 0 of the rand_init sequences above,
- * before any step runs) are both 0xFF: from lfsr = mask (all ones), one
- * step only ever touches the bit(s) each generator feeds back in -
- * bit 8 for the 9-bit case (masked off by RANDOM_C's `& 0xff`), and
- * bit 7 (cleared) plus bit 16 (set from the fed-back-in bit) for the
- * 17-bit case, both outside the bits-8-15 window `>> 8 & 0xff` reads -
- * so neither generator's RANDOM byte moves on step 0.  That is what a
- * chip held in SKCTL reset (m_p9 = m_p17 = 0, held there - see
- * read_random()'s comment) reads back, independent of AUDCTL's poly9/17
- * select.
+/* rand9[0] (index 0 of the rand_init sequence above, before any step
+ * runs) is 0xFF: from lfsr = mask (all ones), one step only ever touches
+ * bit 8, masked off by RANDOM_C's `& 0xff`, so the 9-bit generator's
+ * RANDOM byte doesn't move on step 0.  The 17-bit chain is different: a
+ * gate-level transcription of Atari's POKEY schematics shows it does not
+ * settle at position 0 while held - it takes several of the chain's own
+ * steps to reach a fixed state, and it reaches that state at table
+ * position RAND17_RESET_POS (8), not 0.  Entries 0..8 of rand17 (the
+ * settling steps and the position itself) are all 0xFF anyway - bit 7
+ * (cleared) and bit 16 (set from the fed-back-in bit) stay outside the
+ * bits-8-15 window `>> 8 & 0xff` reads for all of them - so a chip held
+ * in SKCTL reset (rand_pos9 = 0, rand_pos17 = RAND17_RESET_POS, held
+ * there - see read_random()'s comment) reads 0xFF from either table,
+ * independent of AUDCTL's poly9/17 select, but only the 9-bit table is
+ * actually sitting at its table index 0.
  *
  * The rest of this check is the clock discipline MAME's SKCTL_C handler
  * and step_one_clock() give the reset: while the init bits are clear no
  * cycle moves the polynomial (Tempest's init at $CD95 zeroes SKCTL and
  * then reads RANDOM six times over a few dozen cycles, flagging the chip
  * if any two differ); machine time that passes while held is NOT charged
- * at release - counting starts from the release write; rewriting SKCTL
- * with the same value is a no-op (MAME: `if (data == m_SKCTL) return;`);
- * and a write that changes other bits but keeps the init bits set does
- * not restart the sequence. */
+ * at release - counting starts from the release write, at position 8 for
+ * the 17-bit chain; rewriting SKCTL with the same value is a no-op
+ * (MAME: `if (data == m_SKCTL) return;`); and a write that changes other
+ * bits but keeps the init bits set does not restart the sequence. */
 static void check_random_skctl(void)
 {
     ad_pokey chip;
@@ -209,28 +219,29 @@ static void check_random_skctl(void)
     ad_pokey_write(&chip, W_SKCTL, 0);         /* init bits clear: $CD95's reset */
     for (int i = 0; i < 6; i++) {
         uint8_t v = ad_pokey_read(&chip, R_RANDOM);
-        CHECK(v == 0xFF, "held-reset read %d should be 0xFF (poly17[0], AUDCTL=0), got %02X", i, v);
+        CHECK(v == 0xFF, "held-reset read %d should be 0xFF (poly17[%d], AUDCTL=0), got %02X",
+              i, RAND17_RESET_POS, v);
         ad_pokey_advance(&chip, 4);            /* CMP abs after LDA abs: 4 cycles */
     }
 
     ad_pokey_advance(&chip, 1000);             /* time spent held: must not count */
-    ad_pokey_write(&chip, W_SKCTL, 7);         /* release: position 0 from here */
+    ad_pokey_write(&chip, W_SKCTL, 7);         /* release: position 8 from here */
     uint8_t v = ad_pokey_read(&chip, R_RANDOM);
-    CHECK(v == rand17[0], "at release RANDOM should read entry 0, got %02X", v);
+    CHECK(v == rand17[8], "at release RANDOM should read entry 8, got %02X", v);
     ad_pokey_advance(&chip, 4);
     v = ad_pokey_read(&chip, R_RANDOM);
-    CHECK(v == rand17[4], "4 cycles after release RANDOM should read entry 4 (not 1004): got %02X, expected %02X",
-          v, rand17[4]);
+    CHECK(v == rand17[12], "4 cycles after release RANDOM should read entry 12 (not 1012): got %02X, expected %02X",
+          v, rand17[12]);
 
     ad_pokey_write(&chip, W_SKCTL, 7);         /* same value: no-op */
     v = ad_pokey_read(&chip, R_RANDOM);
-    CHECK(v == rand17[4], "rewriting SKCTL with the same value should not restart: got %02X", v);
+    CHECK(v == rand17[12], "rewriting SKCTL with the same value should not restart: got %02X", v);
 
     ad_pokey_write(&chip, W_SKCTL, 3);         /* init bits still set: no restart */
     v = ad_pokey_read(&chip, R_RANDOM);
-    CHECK(v == rand17[4], "SKCTL 7->3 keeps the init bits set and should not restart: got %02X", v);
+    CHECK(v == rand17[12], "SKCTL 7->3 keeps the init bits set and should not restart: got %02X", v);
 
-    ad_pokey_advance(&chip, 60);               /* position 64 again */
+    ad_pokey_advance(&chip, 60);               /* position 8+64 again */
     v = ad_pokey_read(&chip, R_RANDOM);
     CHECK(v == expect17[0], "64 cycles after release RANDOM should match check (2)'s first byte: got %02X", v);
 }
@@ -511,6 +522,245 @@ static void check_silence(void)
     CHECK(all_zero, "after reset, all four channels should render zeros");
 }
 
+/* ------------------------------------------------------------------ */
+/* (11) IRQ timers, keyboard, serial, pots                             */
+/* ------------------------------------------------------------------ */
+/* A host stub that records every callback the chip can make, so this
+ * check drives ad_pokey_write()/read()/advance()/keyboard_key()/
+ * serial_receive()/poll() through the same ad_pokey_host seam a real
+ * host uses, rather than reaching into the chip directly.  th is a
+ * fresh static struct per check_host_seam() call (there's only one, but
+ * memset at the top keeps it that way if that changes). */
+static struct {
+    uint8_t irq_mask;             /* OR of every raise_irq() mask seen */
+    int     irq_calls;
+    uint8_t serout_byte;
+    int     serout_calls;
+    int     kbd_code_queued;      /* -1 once keyboard_scan has consumed it */
+    int     serial_byte_queued;   /* -1 once serial_in has consumed it */
+} th;
+
+static void th_raise_irq(void *ctx, uint8_t mask)
+{
+    (void)ctx;
+    th.irq_mask |= mask;
+    th.irq_calls++;
+}
+
+static int th_pot_read(void *ctx, int n)
+{
+    (void)ctx;
+    return n * 10;
+}
+
+static int th_keyboard_scan(void *ctx, uint8_t *code, uint8_t *flags)
+{
+    (void)ctx;
+    if (th.kbd_code_queued < 0)
+        return 0;
+    *code = (uint8_t)th.kbd_code_queued;
+    *flags = 0;
+    th.kbd_code_queued = -1;
+    return 1;
+}
+
+static int th_serial_in(void *ctx)
+{
+    (void)ctx;
+    if (th.serial_byte_queued < 0)
+        return -1;
+    int b = th.serial_byte_queued;
+    th.serial_byte_queued = -1;
+    return b;
+}
+
+static void th_serial_out(void *ctx, uint8_t data)
+{
+    (void)ctx;
+    th.serout_byte = data;
+    th.serout_calls++;
+}
+
+static const ad_pokey_host test_host = {
+    NULL, th_raise_irq, th_pot_read, th_keyboard_scan, th_serial_in, th_serial_out
+};
+
+static void check_host_seam(void)
+{
+    ad_pokey chip;
+    ad_pokey_init(&chip, 1512000, 44100);
+    memset(&th, 0, sizeof th);
+    th.kbd_code_queued = -1;
+    th.serial_byte_queued = -1;
+    ad_pokey_set_host(&chip, &test_host);
+
+    /* --- timer 0 (TIMR1, channel 0): SKCTL=7, AUDCTL=0, AUDF1=0 ->
+     * period = (0 + 1) * DIV_64 = 28 cycles. --- */
+    ad_pokey_write(&chip, W_SKCTL, 7);
+    ad_pokey_write(&chip, W_AUDCTL, 0x00);
+    ad_pokey_write(&chip, W_AUDF1, 0x00);
+    ad_pokey_write(&chip, W_IRQEN, IRQ_TIMR1);
+
+    ad_pokey_advance(&chip, 27);
+    CHECK(th.irq_calls == 0, "timer1: no IRQ after 27 of 28 cycles, got %d call(s)", th.irq_calls);
+    uint8_t irqst = ad_pokey_read(&chip, R_IRQST);
+    CHECK(irqst == 0xFF, "timer1: R_IRQST should read 0xFF before the first borrow, got %02X", irqst);
+
+    ad_pokey_advance(&chip, 1);            /* the 28th cycle: the borrow fires */
+    CHECK(th.irq_calls == 1 && th.irq_mask == IRQ_TIMR1,
+          "timer1: raise_irq(0x01) should fire at cycle 28, got %d call(s), mask %02X",
+          th.irq_calls, th.irq_mask);
+    irqst = ad_pokey_read(&chip, R_IRQST);
+    CHECK(irqst == (uint8_t)~IRQ_TIMR1,
+          "timer1: R_IRQST should read 0xFE (bit 0 set) after the borrow, got %02X", irqst);
+
+    ad_pokey_advance(&chip, 28 * 5);       /* five more periods in one slice: IRQST is a latch */
+    CHECK(th.irq_calls == 2, "timer1: a slice spanning several periods should still call raise_irq() once, got %d total",
+          th.irq_calls);
+    CHECK(th.irq_mask == IRQ_TIMR1, "timer1: IRQST should still just be 0x01, got %02X", th.irq_mask);
+
+    ad_pokey_write(&chip, W_IRQEN, 0);     /* disabling clears the pending IRQST bit */
+    irqst = ad_pokey_read(&chip, R_IRQST);
+    CHECK(irqst == 0xFF, "timer1: IRQEN=0 should clear IRQST, R_IRQST should read 0xFF, got %02X", irqst);
+
+    int calls_before_gate = th.irq_calls;
+    ad_pokey_advance(&chip, 200);          /* the timer keeps counting; IRQEN=0 only gates the callback */
+    CHECK(th.irq_calls == calls_before_gate,
+          "timer1: no raise_irq() while IRQEN=0, got %d new call(s)", th.irq_calls - calls_before_gate);
+
+    /* Re-enable: the countdown was never reset by the IRQEN writes, so
+     * the next borrow lands wherever the 28-cycle phase says it should,
+     * not 28 cycles after this write.  168 cycles (28 + 140) have run
+     * since the last rearm (the AUDF1 write) with the IRQ gated off for
+     * the last 200 of those; 200 % 28 == 4, so the countdown has 24
+     * cycles left, not a fresh 28. */
+    ad_pokey_write(&chip, W_IRQEN, IRQ_TIMR1);
+    int calls_before_phase = th.irq_calls;
+    ad_pokey_advance(&chip, 23);
+    CHECK(th.irq_calls == calls_before_phase,
+          "timer1: phase kept through the gated slice - 23 more cycles should not reach it yet, got %d new call(s)",
+          th.irq_calls - calls_before_phase);
+    ad_pokey_advance(&chip, 1);
+    CHECK(th.irq_calls == calls_before_phase + 1,
+          "timer1: the 24th cycle should reach the phase-preserved borrow, got %d new call(s)",
+          th.irq_calls - calls_before_phase);
+
+    /* --- timer 1 (TIMR2, channel 1): CH12_JOIN + CH1_HICLK, AUDF1=0x10,
+     * AUDF2=0x00 -> period = AUDF2*256 + AUDF1 + 7 = 0x10 + 7 = 23
+     * cycles; the AUDCTL write itself re-arms it. --- */
+    ad_pokey_write(&chip, W_AUDF1, 0x10);
+    ad_pokey_write(&chip, W_AUDF2, 0x00);
+    ad_pokey_write(&chip, W_IRQEN, IRQ_TIMR2);
+    ad_pokey_write(&chip, W_AUDCTL, CTL_CH12_JOIN | CTL_CH1_HICLK);
+    CHECK(chip.divisor[1] == 23, "timer2 setup: channel 1's divisor should be 23, got %u",
+          (unsigned)chip.divisor[1]);
+
+    int calls_before_t2 = th.irq_calls;
+    th.irq_mask = 0;   /* was left holding IRQ_TIMR1 from the section above */
+    ad_pokey_advance(&chip, 22);
+    CHECK(th.irq_calls == calls_before_t2, "timer2: no IRQ after 22 of 23 cycles, got %d new call(s)",
+          th.irq_calls - calls_before_t2);
+    ad_pokey_advance(&chip, 1);
+    CHECK(th.irq_calls == calls_before_t2 + 1 && th.irq_mask == IRQ_TIMR2,
+          "timer2: raise_irq(0x02) should fire at cycle 23, got %d new call(s), mask %02X",
+          th.irq_calls - calls_before_t2, th.irq_mask);
+
+    /* STIMER re-arms every timer to a full period from now, discarding
+     * whatever phase it was mid-way through. */
+    ad_pokey_advance(&chip, 10);           /* 10 cycles into the next 23-cycle period */
+    ad_pokey_write(&chip, W_STIMER, 0);
+    int calls_before_st = th.irq_calls;
+    ad_pokey_advance(&chip, 22);
+    CHECK(th.irq_calls == calls_before_st,
+          "STIMER: no IRQ 22 cycles after STIMER (would have fired already without the rearm), got %d new call(s)",
+          th.irq_calls - calls_before_st);
+    ad_pokey_advance(&chip, 1);
+    CHECK(th.irq_calls == calls_before_st + 1,
+          "STIMER: a full 23-cycle period after STIMER should reach the borrow, got %d new call(s)",
+          th.irq_calls - calls_before_st);
+
+    /* While SKCTL holds the chip in reset, no timer counts - see
+     * ad_pokey_advance(). */
+    ad_pokey_write(&chip, W_SKCTL, 0);
+    int calls_before_held = th.irq_calls;
+    ad_pokey_advance(&chip, 1000);
+    CHECK(th.irq_calls == calls_before_held,
+          "held reset: no timer IRQ over 1000 cycles, got %d new call(s)", th.irq_calls - calls_before_held);
+    ad_pokey_write(&chip, W_SKCTL, 7);     /* release for the keyboard/serial/pot checks below */
+
+    /* --- keyboard --- */
+    ad_pokey_write(&chip, W_IRQEN, IRQ_KEYBD);
+    th.irq_calls = 0; th.irq_mask = 0;
+    ad_pokey_keyboard_key(&chip, 0x21, ST_SHIFT, true);
+    CHECK(th.irq_calls == 1 && th.irq_mask == IRQ_KEYBD,
+          "keyboard: key down with IRQEN=IRQ_KEYBD should raise 0x40, got %d call(s), mask %02X",
+          th.irq_calls, th.irq_mask);
+    CHECK((chip.SKSTAT & (ST_KEYBD | ST_SHIFT)) == (ST_KEYBD | ST_SHIFT),
+          "keyboard: SKSTAT should have ST_KEYBD|ST_SHIFT set, got %02X", chip.SKSTAT);
+    CHECK(chip.KBCODE == 0x21, "keyboard: KBCODE should latch 0x21, got %02X", chip.KBCODE);
+
+    /* A second key before KBCODE is read finds the prior code still
+     * pending and sets the overrun bit, ST_KBERR. */
+    ad_pokey_keyboard_key(&chip, 0x22, 0, true);
+    CHECK((chip.SKSTAT & ST_KBERR) != 0, "keyboard: a second key before the read should set ST_KBERR, got %02X",
+          chip.SKSTAT);
+
+    ad_pokey_write(&chip, W_SKREST, 0);
+    CHECK((chip.SKSTAT & ST_KBERR) == 0, "keyboard: SKREST should clear ST_KBERR, got %02X", chip.SKSTAT);
+
+    uint8_t kb = ad_pokey_read(&chip, R_KBCODE);   /* R_KBCODE also clears kbd_pending */
+    CHECK(kb == 0x22, "keyboard: R_KBCODE should read the still-latched second code, got %02X", kb);
+
+    ad_pokey_keyboard_key(&chip, 0x22, 0, false);  /* key up */
+    CHECK((chip.SKSTAT & ST_KEYBD) == 0, "keyboard: key up should clear ST_KEYBD, got %02X", chip.SKSTAT);
+
+    ad_pokey_write(&chip, W_SKCTL, 0);             /* held: keyboard_key must be ignored */
+    uint8_t skstat_before = chip.SKSTAT;
+    ad_pokey_keyboard_key(&chip, 0x33, 0, true);
+    CHECK(chip.SKSTAT == skstat_before, "keyboard: keyboard_key while SKCTL=0 should be ignored, got %02X (was %02X)",
+          chip.SKSTAT, skstat_before);
+    ad_pokey_write(&chip, W_SKCTL, 7);             /* release again */
+
+    /* --- serial --- */
+    ad_pokey_write(&chip, W_IRQEN, IRQ_SERIN);
+    th.irq_calls = 0; th.irq_mask = 0;
+    ad_pokey_serial_receive(&chip, 0x5A);
+    CHECK(th.irq_calls == 1 && th.irq_mask == IRQ_SERIN,
+          "serial: serial_receive with IRQEN=IRQ_SERIN should raise 0x20, got %d call(s), mask %02X",
+          th.irq_calls, th.irq_mask);
+    CHECK((chip.SKSTAT & ST_SERIN_BUSY) != 0, "serial: SKSTAT should have ST_SERIN_BUSY set, got %02X", chip.SKSTAT);
+
+    uint8_t sv = ad_pokey_read(&chip, R_SERIN);
+    CHECK(sv == 0x5A, "serial: R_SERIN should read 0x5A, got %02X", sv);
+    CHECK((chip.SKSTAT & ST_SERIN_BUSY) == 0, "serial: R_SERIN read should clear ST_SERIN_BUSY, got %02X", chip.SKSTAT);
+
+    ad_pokey_write(&chip, W_SEROUT, 0xA5);
+    CHECK(th.serout_calls == 1 && th.serout_byte == 0xA5,
+          "serial: W_SEROUT should call serial_out(0xA5), got %d call(s), byte %02X",
+          th.serout_calls, th.serout_byte);
+
+    /* --- poll: one keyboard code and one serial byte per call --- */
+    th.kbd_code_queued = 0x55;
+    th.serial_byte_queued = 0x66;
+    ad_pokey_poll(&chip);
+    CHECK(chip.KBCODE == 0x55 && (chip.SKSTAT & ST_KEYBD) != 0,
+          "poll: should pull the queued keyboard code through keyboard_scan, got KBCODE=%02X SKSTAT=%02X",
+          chip.KBCODE, chip.SKSTAT);
+    CHECK(chip.SERIN == 0x66 && (chip.SKSTAT & ST_SERIN_BUSY) != 0,
+          "poll: should pull the queued serial byte through serial_in, got SERIN=%02X SKSTAT=%02X",
+          chip.SERIN, chip.SKSTAT);
+    CHECK(th.kbd_code_queued == -1 && th.serial_byte_queued == -1,
+          "poll: should consume both queued items in one call");
+
+    /* --- pots --- */
+    uint8_t pv = ad_pokey_read(&chip, R_POT0 + 3);
+    CHECK(pv == 30, "pots: R_POT0+3 with the host should read pot_read(ctx,3) = 3*10 = 30, got %d", pv);
+
+    ad_pokey_set_host(&chip, NULL);
+    pv = ad_pokey_read(&chip, R_POT0 + 3);
+    CHECK(pv == 0xFF, "pots: R_POT0+3 with no host should read 0xFF, got %02X", pv);
+}
+
 int ad_probe(void)
 {
     check_periods();
@@ -523,6 +773,7 @@ int ad_probe(void)
     check_allpot();
     check_tone();
     check_silence();
+    check_host_seam();
 
     printf(fails ? "probe: %d failure(s)\n" : "probe: all checks passed\n", fails);
     return fails ? 2 : 0;

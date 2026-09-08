@@ -1,14 +1,17 @@
 /* pokey.h - a POKEY (Atari C012294) sound and RNG core, plain C11.
  *
  * Translated from the AAE emulator's POKEY core
- * (aae/aae/sndhrdwr/aae_pokey.cpp / .h), with every engine binding
- * removed: no timers/IRQ (rearm_timers, on_timer_fire, fire_irq, IRQEN/
- * IRQST), no serial, no keyboard, no eight-pot reads, and none of the
- * AAE adapter (PokeyHost, pokey_sh_*, mixer/stream/timer calls,
- * Read_pokey_regs, quad-pokey, MEM callbacks).  What is kept is exactly
- * what this board uses: AUDF1-4/AUDC1-4/AUDCTL/STIMER/SKCTL writes, and
- * RANDOM/ALLPOT reads (everything else reads back 0xFF, as real POKEY
- * does for a register nothing answers).
+ * (aae/aae/sndhrdwr/aae_pokey.cpp / .h).  The engine-free Pokey class
+ * came back nearly whole: timers 1/2/4 and IRQEN/IRQST, serial (SEROUT/
+ * SERIN/SKREST), keyboard (KBCODE/SKSTAT), and the eight POT reads all
+ * work here, driven through a small host seam (ad_pokey_host) in place
+ * of AAE's virtual PokeyHost - see ad_pokey_set_host() below.  What
+ * stays dropped is the AAE adapter itself: PokeyHost, pokey_sh_*,
+ * mixer/stream/timer calls, Read_pokey_regs, quad-pokey, MEM callbacks
+ * - none of that is chip behaviour, it is AAE's engine wiring.  AUDF1-4/
+ * AUDC1-4/AUDCTL/STIMER/SKCTL writes and RANDOM/ALLPOT reads need no
+ * host at all, same as before; every register nothing answers still
+ * reads back 0xFF.
  *
  * This is not a ROM routine - astdelux2_main.asm never names a "POKEY.C"
  * module, the chip is hardware the ROM merely talks to - so it carries
@@ -26,7 +29,8 @@
  * are set, steps the 9- and 17-bit RANDOM polynomials by n, in O(1).
  * A RANDOM read just returns the byte at the current position; two
  * reads with no advance between them return the same byte.  While SKCTL
- * holds the chip in reset (init bits clear) the positions sit at 0 and
+ * holds the chip in reset (init bits clear) the positions sit fixed -
+ * RAND17_RESET_POS for the 17-bit chain, 0 for the 9-bit one - and
  * advance() does not move them; counting starts from the write that
  * releases the reset, so time that passed while held is never charged
  * afterwards.  The audio side is held the same way: the transition into
@@ -38,6 +42,20 @@
  * separate copies: both count POKEY cycles, but the render lags machine
  * time by up to a host tick, and reconciling them at a read would need
  * the CPU cycle position this port does not have.
+ *
+ * The three hardware timers (TIMR1/TIMR2/TIMR4, driven by channels
+ * 0/1/3) count down the same n-cycle slice ad_pokey_advance() walks:
+ * each timer's countdown is stepped by n in O(1), and if n reaches or
+ * passes it the channel's divisor is added back on as many times as it
+ * takes to land past n - IRQST is a latch, so a slice that crosses
+ * several periods still only raises the IRQ once.  They hold with the
+ * chip: while SKCTL keeps the init bits clear the countdowns do not
+ * move, same as RANDOM and the render phases.  IRQEN only gates whether
+ * a borrow reaches the IRQST latch and the host's raise_irq() - it
+ * never touches a countdown's phase, because the real timers keep
+ * counting whether or not their IRQ is enabled; a countdown re-arms
+ * (restarts a full period from now) only where AUDF/AUDCTL/STIMER
+ * writes say it does - see ad_pokey_write().
  *
  * Who feeds the clock, and how exactly, is the host's business:
  *
@@ -82,20 +100,20 @@
 #define W_AUDC4   0x07
 #define W_AUDCTL  0x08
 #define W_STIMER  0x09
-#define W_SKREST  0x0A   /* dropped: cleared IRQ status bits this port never sets */
+#define W_SKREST  0x0A
 #define W_POTGO   0x0B
-#define W_SEROUT  0x0D   /* dropped: no serial */
-#define W_IRQEN   0x0E   /* dropped: no IRQ */
+#define W_SEROUT  0x0D
+#define W_IRQEN   0x0E
 #define W_SKCTL   0x0F
 
 /* ---- read-register offsets (addr & 0x0F) ---- */
 #define R_POT0    0x00
 #define R_ALLPOT  0x08
-#define R_KBCODE  0x09   /* dropped: no keyboard; reads 0xFF */
+#define R_KBCODE  0x09
 #define R_RANDOM  0x0A
-#define R_SERIN   0x0D   /* dropped: no serial; reads 0xFF */
-#define R_IRQST   0x0E   /* dropped: no IRQ; reads 0xFF */
-#define R_SKSTAT  0x0F   /* dropped: no serial/keyboard status; reads 0xFF */
+#define R_SERIN   0x0D
+#define R_IRQST   0x0E
+#define R_SKSTAT  0x0F
 
 /* ---- AUDC bits ---- */
 #define AUDC_NOTPOLY5  0x80
@@ -114,20 +132,69 @@
 #define CTL_CH2_FILTER 0x02
 #define CTL_CLK15      0x01
 
+/* ---- IRQEN / IRQST bits ---- */
+#define IRQ_BREAK  0x80
+#define IRQ_KEYBD  0x40
+#define IRQ_SERIN  0x20
+#define IRQ_SEROR  0x10
+#define IRQ_SEROC  0x08
+#define IRQ_TIMR4  0x04
+#define IRQ_TIMR2  0x02
+#define IRQ_TIMR1  0x01
+
 /* ---- SKCTL bits ---- */
-#define SK_BREAKEN  0x80   /* unused: no serial break to enable */
-#define SK_BPS      0x70   /* unused: no serial */
-#define SK_TWOTONE  0x08   /* unused: no serial */
+#define SK_BREAKEN  0x80   /* unused: no serial break generation modelled */
+#define SK_BPS      0x70   /* unused: no serial baud-rate divider modelled */
+#define SK_TWOTONE  0x08   /* unused: no serial two-tone mode modelled */
 #define SK_FASTPOT  0x04
 #define SK_INIT     0x03
+
+/* ---- SKSTAT bits ---- */
+#define ST_FRAME       0x80
+#define ST_OVERRUN     0x40
+#define ST_KBERR       0x20
+#define ST_SERIN_BUSY  0x10
+#define ST_SHIFT       0x08
+#define ST_KEYBD       0x04
+#define ST_SEROUT_ACT  0x02
 
 /* ---- timing divisors ---- */
 #define DIV_64  28
 #define DIV_15  114
 
+/* The 17-bit RNG chain's position while SKCTL holds the chip in reset
+ * (init bits clear), and where it lands at the release write - not 0.
+ * Simulated register-for-register against a gate-level transcription of
+ * Atari's POKEY schematics (Nick Mikstas's atari_pokey, poly_core.v):
+ * with the chain held, the zeros shifting in from the head and the XNOR
+ * feedback shifting ones into the tail settle it at table position 8 of
+ * g_rand17 (entries 0..8 are all 0xFF), one clock later at position 9,
+ * and so on from there - see read_random()'s comment in pokey.c.  The
+ * 9-bit chain settles at position 0 of g_rand9, which was already
+ * right. */
+#define RAND17_RESET_POS 8
+
 /* ---- render gain: AUDC volume nibble (0-15) times this is the level a
  * fully-on channel contributes to a sample ---- */
 #define POKEY_GAIN (32767 / 11)
+
+/* Host seam: the entire contract between the chip and the world, in
+ * place of AAE's virtual PokeyHost.  A plain vtable-of-function-pointers
+ * struct, not a C++ interface, so it builds on a microcontroller.  Every
+ * callback is optional - ad_pokey NULL-checks each before calling it -
+ * and the whole pointer may be NULL (ad_pokey_set_host(p, NULL)), which
+ * is the default: a chip with no host wired up behaves exactly as this
+ * port did before the host seam existed (writes/reads/advance/render
+ * all still work; IRQs are just never raised, pots read 0xFF, keyboard
+ * and serial are never fed). */
+typedef struct ad_pokey_host {
+    void *ctx;
+    void (*raise_irq)(void *ctx, uint8_t mask);          /* IRQST bits that just fired */
+    int  (*pot_read)(void *ctx, int n);                   /* POT0-7 count, 0..228 */
+    int  (*keyboard_scan)(void *ctx, uint8_t *code, uint8_t *flags); /* 1 if a code is waiting */
+    int  (*serial_in)(void *ctx);                         /* next SERIN byte, or -1 */
+    void (*serial_out)(void *ctx, uint8_t data);
+} ad_pokey_host;
 
 /* A POKEY chip instance.  Everything here is the subset of Pokey's
  * private state this board's use of the chip touches; see the .cpp for
@@ -145,9 +212,9 @@ typedef struct ad_pokey {
     uint32_t base_mult;      /* DIV_64 or DIV_15, from AUDCTL bit 0 */
 
     /* audio channels */
-    uint32_t divisor[4];     /* true half-period in base-clock ticks (timer-
-                               * facing in the original; nothing reads this
-                               * without IRQ/timers, kept for fidelity) */
+    uint32_t divisor[4];     /* true half-period in base-clock ticks; also
+                               * the period each hardware timer below re-
+                               * arms to (channel_period(), recompute_channel()) */
     uint32_t rmax[4];        /* render Div_n_max (= divisor[i], or frozen) */
     uint32_t cnt[4];         /* render countdown (Div_n_cnt) */
     uint8_t  out[4];         /* render output level / toggle latch (Outvol) */
@@ -159,10 +226,29 @@ typedef struct ad_pokey {
 
     /* RNG: the 9- and 17-bit polynomial positions, stepped by
      * ad_pokey_advance() while the SKCTL init bits are set (rng_enabled),
-     * held at 0 while they are clear; RANDOM reads index the tables at
-     * these positions */
+     * held at RAND17_RESET_POS/0 while they are clear; RANDOM reads
+     * index the tables at these positions */
     uint8_t  rng_enabled;
     uint32_t rand_pos9, rand_pos17;
+
+    /* hardware timers: TIMR1/TIMR2/TIMR4, driven by channels 0/1/3
+     * (tcnt index w -> channel timer_channel(w) in pokey.c).  Countdowns
+     * in POKEY cycles, stepped by ad_pokey_advance() while rng_enabled;
+     * IRQEN, IRQST are the usual latch-and-mask pair (see fire_irq() and
+     * ad_pokey_write()'s W_IRQEN case) */
+    uint32_t tcnt[3];
+    uint8_t  IRQEN, IRQST;
+
+    /* keyboard: KBCODE/SKSTAT track AAE's keyboard_key()/scan_keyboard();
+     * kbd_pending mirrors AAE's kbd_pending_ (an unread code -> the next
+     * key sets ST_KBERR instead of silently overwriting it) */
+    uint8_t  KBCODE, SKSTAT;
+    bool     kbd_pending;
+
+    /* serial: byte-at-a-time pass-through, no baud/framing modelled
+     * (SK_BPS/SK_BREAKEN/SK_TWOTONE stay unused - see pokey.h's bit
+     * defines) */
+    uint8_t  SERIN, SEROUT;
 
     /* running machine time in POKEY cycles, fed only by
      * ad_pokey_advance(); the ALLPOT scan window measures against it */
@@ -175,16 +261,30 @@ typedef struct ad_pokey {
     bool     pot_scanning;
     bool     pot_scan_ever;   /* sticky: true from this chip's first POTGO on */
     uint64_t pot_scan_start;
+
+    /* host wiring: NULL until ad_pokey_set_host() - see ad_pokey_host
+     * above.  Not touched by ad_pokey_reset(), same as allpot: it is
+     * host-owned wiring, not chip state a reset clears. */
+    const ad_pokey_host *host;
 } ad_pokey;
 
 void    ad_pokey_init(ad_pokey *p, uint32_t clock_hz, uint32_t sample_rate);
 void    ad_pokey_reset(ad_pokey *p);
 void    ad_pokey_write(ad_pokey *p, uint8_t reg, uint8_t v);   /* reg 0..15 */
-uint8_t ad_pokey_read(ad_pokey *p, uint8_t reg);               /* RANDOM, ALLPOT; else 0xFF */
+uint8_t ad_pokey_read(ad_pokey *p, uint8_t reg);               /* RANDOM, ALLPOT, IRQST, SKSTAT,
+                                                                * KBCODE, SERIN, POT0-7; else 0xFF */
 void    ad_pokey_set_allpot(ad_pokey *p, uint8_t v);           /* the DIP bank on the pot pins */
-void    ad_pokey_advance(ad_pokey *p, uint32_t cycles);        /* machine time, POKEY cycles;
-                                                                * the only thing that clocks RANDOM */
+void    ad_pokey_set_host(ad_pokey *p, const ad_pokey_host *h); /* NULL = no host (default) */
+void    ad_pokey_advance(ad_pokey *p, uint32_t cycles);        /* machine time, POKEY cycles; the
+                                                                * only thing that clocks RANDOM and
+                                                                * the hardware timers */
 void    ad_pokey_render(ad_pokey *p, int16_t *dst, int n);     /* n mono samples at sample_rate */
+void    ad_pokey_keyboard_key(ad_pokey *p, uint8_t code, uint8_t flags, bool down);
+void    ad_pokey_serial_receive(ad_pokey *p, uint8_t data);
+void    ad_pokey_poll(ad_pokey *p);                             /* host per-frame poll: pulls one
+                                                                * keyboard code and one serial byte
+                                                                * through the host, if either is
+                                                                * waiting */
 
 #ifdef AD_PROBE
 /* Test-only accessors for the shared static poly/RNG tables (built once,
