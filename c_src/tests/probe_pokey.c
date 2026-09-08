@@ -202,11 +202,34 @@ static void check_random_9(void)
  * window `>> 8 & 0xff` reads for all of them - and the chip's settled
  * state is entry 8 (RESET_POS17), not 0.  Check (12) pins the clock-by-
  * clock behaviour against a register-level model; this check keeps the
- * ROM-facing contract: Tempest's init at $CD95 zeroes SKCTL and then
- * reads RANDOM six times a few cycles apart, flagging the chip if any
- * two differ - modelled here as the first read landing eight cycles
- * after the write (the store to the second POKEY and the load), then
- * LDA abs / CMP abs pairs four cycles apart.
+ * ROM-facing contract, and the contract that matters is Tempest's POKEY
+ * protection at $CD95 (the commented Tempest source), played here on
+ * two chips with the listing's own cycle counts, the write strobe of
+ * each STA and the read strobe of each LDA/LDY/CMP/CPY on the
+ * instruction's last cycle:
+ *
+ *     CD95 LDA #0          2
+ *     CD97 STA $60CF       4   POKEY1 SKCTL = 0    strobe at cycle 0
+ *     CD9A STA $60DF       4   POKEY2 SKCTL = 0    strobe at 4
+ *     CD9D STA $0720       4
+ *     CDA0 LDX #4          2
+ *     CDA2 LDA $60CA       4   POKEY1 RANDOM       read at 14
+ *     CDA5 LDY $60DA       4   POKEY2 RANDOM       read at 18
+ *     CDA8 CMP $60CA       4   POKEY1 RANDOM       read at 22, 38, 54, 70, 86
+ *     CDAB BNE $CDB0       2   (a mismatch flags $0720 and leaves)
+ *     CDAD CPY $60DA       4   POKEY2 RANDOM       read at 26, 42, 58, 74, 90
+ *     CDB0 BEQ $CDB7       3   (a mismatch flags $0720 and leaves)
+ *     CDB7 DEX             2
+ *     CDB8 BPL $CDA8       3   five compares in all
+ *     CDBA LDA #7          2
+ *     CDBC STA $60CF       4   POKEY1 SKCTL = 7    strobe at 100
+ *     CDBF STA $60DF       4   POKEY2 SKCTL = 7    strobe at 104
+ *
+ * So each chip's first read lands fourteen clocks after its own SKCTL
+ * store, six clocks after its 9-bit register has filled with zeros,
+ * and every compare must then see the same 0xFF the LDA/LDY saw.  Any
+ * model that reads 0xFF from eight clocks after the write on passes;
+ * the chip has six clocks of margin.
  *
  * The rest is the clock discipline: rewriting SKCTL with the same value
  * is a no-op (MAME: `if (data == m_SKCTL) return;`); a write that
@@ -224,15 +247,43 @@ static void check_random_skctl(void)
     uint8_t first = ad_pokey_read(&chip, R_RANDOM);
     CHECK(first == expect17[0], "sanity: first RANDOM byte should match check (2), got %02X", first);
 
-    ad_pokey_write(&chip, W_SKCTL, 0);         /* init bits clear: $CD95's reset */
-    ad_pokey_advance(&chip, 8);                /* the zeros need eight clocks to fill the register */
-    for (int i = 0; i < 6; i++) {
-        uint8_t v = ad_pokey_read(&chip, R_RANDOM);
-        CHECK(v == 0xFF, "held-reset read %d should be 0xFF (rand17[%d], AUDCTL=0), got %02X",
-              i, RESET_POS17, v);
-        ad_pokey_advance(&chip, 4);            /* CMP abs after LDA abs: 4 cycles */
+    /* $CD95 on both POKEYs, from a running state a game's worth of
+     * cycles in, with the listing's spacing.  Both chips are advanced
+     * together, as on the board. */
+    {
+        ad_pokey p1, p2;
+        ad_pokey_init(&p1, 1512000, 44100);
+        ad_pokey_init(&p2, 1512000, 44100);
+        ad_pokey_write(&p1, W_SKCTL, 7);
+        ad_pokey_write(&p2, W_SKCTL, 7);
+        ad_pokey_advance(&p1, 123457); ad_pokey_advance(&p2, 123457 + 4);
+        ad_pokey_write(&p1, W_SKCTL, 0);                             /* CD97, cycle 0 */
+        ad_pokey_advance(&p1, 4); ad_pokey_advance(&p2, 4);
+        ad_pokey_write(&p2, W_SKCTL, 0);                             /* CD9A, cycle 4 */
+        ad_pokey_advance(&p1, 10); ad_pokey_advance(&p2, 10);
+        uint8_t a = ad_pokey_read(&p1, R_RANDOM);                    /* CDA2, cycle 14 */
+        ad_pokey_advance(&p1, 4); ad_pokey_advance(&p2, 4);
+        uint8_t y = ad_pokey_read(&p2, R_RANDOM);                    /* CDA5, cycle 18 */
+        CHECK(a == 0xFF && y == 0xFF, "$CDA2/$CDA5: the first reads after the reset should be 0xFF, got %02X %02X", a, y);
+        int flagged = 0;
+        for (int x = 4; x >= 0; x--) {
+            ad_pokey_advance(&p1, 4); ad_pokey_advance(&p2, 4);
+            if (ad_pokey_read(&p1, R_RANDOM) != a) flagged++;        /* CDA8 CMP */
+            ad_pokey_advance(&p1, 4); ad_pokey_advance(&p2, 4);
+            if (ad_pokey_read(&p2, R_RANDOM) != y) flagged++;        /* CDAD CPY */
+            ad_pokey_advance(&p1, 8); ad_pokey_advance(&p2, 8);      /* BEQ DEX BPL */
+        }
+        CHECK(flagged == 0, "$CD95: %d compare(s) differed from the first read; the ROM would flag $0720", flagged);
+        ad_pokey_advance(&p1, 2); ad_pokey_advance(&p2, 2);          /* BPL not taken, LDA #7 */
+        ad_pokey_write(&p1, W_SKCTL, 7);                             /* CDBC, cycle 100 */
+        ad_pokey_advance(&p1, 4); ad_pokey_advance(&p2, 4);
+        ad_pokey_write(&p2, W_SKCTL, 7);                             /* CDBF, cycle 104 */
+        ad_pokey_advance(&p1, 64); ad_pokey_advance(&p2, 64);
+        CHECK(ad_pokey_read(&p1, R_RANDOM) != 0xFF || ad_pokey_read(&p2, R_RANDOM) != 0xFF,
+              "$CDBC/$CDBF: both chips should be running again after the release");
     }
 
+    ad_pokey_write(&chip, W_SKCTL, 0);         /* init bits clear: $CD95's reset */
     ad_pokey_advance(&chip, 1000);             /* time spent held: the chain is at rest */
     ad_pokey_write(&chip, W_SKCTL, 7);         /* release: position 8 from here */
     uint8_t v = ad_pokey_read(&chip, R_RANDOM);
@@ -313,12 +364,24 @@ static void check_tempest_ae1f(void)
 /* ------------------------------------------------------------------ */
 /* (6) Tempest's liveness check, and the bus read costing nothing      */
 /* ------------------------------------------------------------------ */
-/* $DA46: LDA $60CA, then up to six CMP $60CA four cycles apart; if every
- * one matched the first byte the chip is flagged dead ($7A).  Any real
- * clock feed passes this.  The second half pins the other side of the
- * contract: a read charges no cycles of its own, so two reads with no
- * machine time between them return the same byte - the host, not the
- * chip, decides what an un-annotated read costs. */
+/* $DA46 (the commented Tempest source), on a running chip:
+ *
+ *     DA44 LDX #5          2
+ *     DA46 LDA $60CA       4   read at cycle 0
+ *     DA49 CMP $60CA       4   read at 4, then 15, 26, 37, 48, 59
+ *     DA4C BNE $DA53       3   a mismatch leaves: the chip is alive
+ *     DA4E DEX             2
+ *     DA4F BPL $DA49       3
+ *     DA51 STA $7A             six matches: the chip is flagged dead
+ *
+ * The same again on POKEY2 at $DA55.  Any real clock feed passes this:
+ * with the chain shifting once a cycle, the read four cycles on has
+ * the first read's high nibble as its low nibble (check (5)) and a
+ * fresh high nibble, so two equal reads are a 1-in-16 coincidence and
+ * six in a row do not happen.  The second half pins the other side of
+ * the contract: a read charges no cycles of its own, so two reads with
+ * no machine time between them return the same byte - the host, not
+ * the chip, decides what an un-annotated read costs. */
 static void check_tempest_da46(void)
 {
     ad_pokey chip;
@@ -326,14 +389,20 @@ static void check_tempest_da46(void)
     ad_pokey_write(&chip, W_SKCTL, 7);
     ad_pokey_advance(&chip, 1234);
 
-    uint8_t a = ad_pokey_read(&chip, R_RANDOM);
-    int same = 0;
-    for (int i = 0; i < 6; i++) {
+    int dead = 0;
+    for (int trial = 0; trial < 50; trial++) {
+        ad_pokey_advance(&chip, 977u + (uint32_t)trial * 313u);    /* somewhere in a game */
+        uint8_t a = ad_pokey_read(&chip, R_RANDOM);                 /* DA46 */
+        int same = 0;
         ad_pokey_advance(&chip, 4);
-        if (ad_pokey_read(&chip, R_RANDOM) == a)
-            same++;
+        for (int x = 5; x >= 0; x--) {
+            if (ad_pokey_read(&chip, R_RANDOM) == a) same++;        /* DA49 */
+            else break;
+            ad_pokey_advance(&chip, 11);                            /* BNE DEX BPL CMP */
+        }
+        if (same == 6) dead++;
     }
-    CHECK(same < 6, "$DA46: six 4-cycle-spaced reads all equal the first; the ROM would flag the chip dead");
+    CHECK(dead == 0, "$DA46: %d of 50 runs saw six compares equal the first read; the ROM would flag the chip dead", dead);
 
     uint8_t b = ad_pokey_read(&chip, R_RANDOM);
     uint8_t c = ad_pokey_read(&chip, R_RANDOM);
