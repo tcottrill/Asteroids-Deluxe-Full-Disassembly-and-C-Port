@@ -63,7 +63,18 @@
  * a held chip's timers only count if their channel runs off the fast
  * clock (AUDCTL's CH1/CH3 fast-clock bits, and the joined partner of
  * such a channel); the slow-clock ones stand still until release,
- * keeping their phase.  IRQEN only gates whether
+ * keeping their phase.  The serial port runs off those borrows too:
+ * SKCTL bits 4..6 pick timer 4 for the receiver and timer 4 or 2 for
+ * the transmitter (or the board's external bit clock, which no host
+ * here supplies, so that direction stands still), a bit is two borrows,
+ * a frame ten bits.  A SEROUT byte is taken by the shifter at the next
+ * borrow and raises "output data needed" then; it reaches the host's
+ * serial_out() when its stop bit has left the pin; "transmission
+ * finished" (IRQST bit 3) is a live level, low whenever the transmitter
+ * is idle.  A byte arriving - the host's serial_in(), asked whenever
+ * the receiver is idle, or ad_pokey_serial_receive() - lands in SERIN
+ * ten bit periods later, raising the input IRQ, and the overrun latch
+ * if the previous input IRQ was still pending.  IRQEN only gates whether
  * a borrow reaches the IRQST latch and the host's raise_irq() - it
  * never touches a countdown's phase, because the real timers keep
  * counting whether or not their IRQ is enabled; a countdown re-arms
@@ -156,20 +167,24 @@
 #define IRQ_TIMR1  0x01
 
 /* ---- SKCTL bits ---- */
-#define SK_BREAKEN  0x80   /* unused: no serial break generation modelled */
-#define SK_BPS      0x70   /* unused: no serial baud-rate divider modelled */
-#define SK_TWOTONE  0x08   /* unused: no serial two-tone mode modelled */
+#define SK_BREAKEN  0x80   /* unused: forcing the serial output low (break) is not modelled */
+#define SK_SERMODE  0x70   /* serial clock select, bits 6..4 - see sdi_timer()/sdo_timer() */
+#define SK_ASYNC    0x10   /* bit 4: the input start bit resynchronises timers 3 and 4 */
+#define SK_TWOTONE  0x08   /* unused: two-tone (cassette) output is not modelled */
 #define SK_FASTPOT  0x04
-#define SK_INIT     0x03
+#define SK_INIT     0x03   /* both clear: the chip is held (Init) */
+#define SK_KEYSCAN  0x02   /* the keyboard scanner runs */
+#define SK_DEBOUNCE 0x01
 
-/* ---- SKSTAT bits ---- */
-#define ST_FRAME       0x80
-#define ST_OVERRUN     0x40
-#define ST_KBERR       0x20
-#define ST_SERIN_BUSY  0x10
-#define ST_SHIFT       0x08
-#define ST_KEYBD       0x04
-#define ST_SEROUT_ACT  0x02
+/* ---- SKSTAT bits, as read: each condition reads as a 0 ---- */
+#define ST_FRAME       0x80   /* serial input frame error, latched until SKREST */
+#define ST_OVERRUN     0x40   /* serial input overrun, latched until SKREST */
+#define ST_KBERR       0x20   /* keyboard overrun, latched until SKREST */
+#define ST_SERIN_DATA  0x10   /* the serial input line itself, live (1 = mark) */
+#define ST_SHIFT       0x08   /* shift key down, live */
+#define ST_KEYBD       0x04   /* a key down, live */
+#define ST_SERIN_BUSY  0x02   /* input shift register receiving a frame, live */
+#define ST_ALWAYS_ONE  0x01
 
 /* ---- timing divisors ---- */
 #define DIV_64  28
@@ -261,16 +276,29 @@ typedef struct ad_pokey {
     uint32_t tcnt[3];
     uint8_t  IRQEN, IRQST;
 
-    /* keyboard: KBCODE/SKSTAT track AAE's keyboard_key()/scan_keyboard();
-     * kbd_pending mirrors AAE's kbd_pending_ (an unread code -> the next
-     * key sets ST_KBERR instead of silently overwriting it) */
-    uint8_t  KBCODE, SKSTAT;
-    bool     kbd_pending;
+    /* keyboard: the last code, and the two live conditions SKSTAT
+     * shows; a keyboard overrun is a new code arriving while the
+     * keyboard IRQ is still pending in IRQST (see keyboard_key()) */
+    uint8_t  KBCODE;
+    bool     kb_down, kb_shift;
 
-    /* serial: byte-at-a-time pass-through, no baud/framing modelled
-     * (SK_BPS/SK_BREAKEN/SK_TWOTONE stay unused - see pokey.h's bit
-     * defines) */
+    /* serial port: a byte at a time, but timed in the selected timer's
+     * borrows - two per bit, twenty per frame (see pokey.c's "Serial
+     * port" section).  SEROUT is the output data register; sdo_pending
+     * says the shifter has not taken it yet; sdo_busy/sdo_byte/sdo_left
+     * are the frame leaving the pin.  sdi_* is the frame arriving;
+     * SERIN takes it at the stop bit. */
     uint8_t  SERIN, SEROUT;
+    bool     sdo_pending, sdo_busy;
+    uint8_t  sdo_byte;
+    uint32_t sdo_left;
+    bool     sdi_busy;
+    uint8_t  sdi_byte;
+    uint32_t sdi_left;
+
+    /* SKSTAT's three latches, set = the condition happened; SKREST
+     * clears them.  ST_FRAME | ST_OVERRUN | ST_KBERR. */
+    uint8_t  st_latch;
 
     /* running machine time in POKEY cycles, fed only by
      * ad_pokey_advance(); the ALLPOT scan window measures against it */
@@ -302,11 +330,13 @@ void    ad_pokey_advance(ad_pokey *p, uint32_t cycles);        /* machine time, 
                                                                 * the hardware timers */
 void    ad_pokey_render(ad_pokey *p, int16_t *dst, int n);     /* n mono samples at sample_rate */
 void    ad_pokey_keyboard_key(ad_pokey *p, uint8_t code, uint8_t flags, bool down);
-void    ad_pokey_serial_receive(ad_pokey *p, uint8_t data);
+                                                               /* flags: ST_SHIFT = shift key down */
+void    ad_pokey_serial_receive(ad_pokey *p, uint8_t data);    /* a start bit now: the frame takes
+                                                                * ten bit periods; dropped if the
+                                                                * receiver is busy or unclocked */
 void    ad_pokey_poll(ad_pokey *p);                             /* host per-frame poll: pulls one
-                                                                * keyboard code and one serial byte
-                                                                * through the host, if either is
-                                                                * waiting */
+                                                                * keyboard code through the host,
+                                                                * if one is waiting */
 
 #ifdef AD_PROBE
 /* Test-only accessors for the shared static poly/RNG tables (built once,

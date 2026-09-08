@@ -408,6 +408,11 @@ static void fire_irq(ad_pokey *p, uint8_t mask)
         p->host->raise_irq(p->host->ctx, mask);
 }
 
+/* The serial port and SKSTAT, defined in their own section below. */
+static bool    sdo_idle(const ad_pokey *p);
+static uint8_t skstat_read(const ad_pokey *p);
+static void    serial_step(ad_pokey *p, const uint32_t *borrows);
+
 /* Restart timer w's countdown a full period (the driving channel's
  * current divisor) from now.  Called only from the writes that AAE's
  * rearm_timers() covers - AUDF/AUDCTL/STIMER - never from an AUDC or
@@ -479,9 +484,14 @@ void ad_pokey_reset(ad_pokey *p)
     for (int i = 0; i < 3; ++i)
         p->tcnt[i] = p->divisor[timer_channel(i)];
     p->IRQEN = p->IRQST = 0;
-    p->KBCODE = p->SKSTAT = 0;
-    p->kbd_pending = false;
+    p->KBCODE = 0;
+    p->kb_down = p->kb_shift = false;
     p->SERIN = p->SEROUT = 0;
+    p->sdo_pending = p->sdo_busy = false;
+    p->sdo_byte = 0; p->sdo_left = 0;
+    p->sdi_busy = false;
+    p->sdi_byte = 0; p->sdi_left = 0;
+    p->st_latch = 0;
     /* p->cycles, p->allpot and p->host are this port's stand-ins for
      * host-owned state (the machine clock, the DIP bank, the callback
      * wiring) - a chip reset doesn't touch any of them, same as
@@ -528,6 +538,7 @@ void ad_pokey_advance(ad_pokey *p, uint32_t cycles)
      * *next* borrow, with phase intact (see pokey.h's timer paragraph).
      * channel_period() (behind divisor[]) never returns 0, so this never
      * divides by zero. */
+    uint32_t borrows[3] = { 0, 0, 0 };
     for (int w = 0; w < 3; ++w) {
         if (!timer_runs(p, w))
             continue;
@@ -535,12 +546,14 @@ void ad_pokey_advance(ad_pokey *p, uint32_t cycles)
         if (cycles >= p->tcnt[w]) {
             uint32_t n = (cycles - p->tcnt[w]) / divisor + 1;
             p->tcnt[w] += n * divisor;
+            borrows[w] = n;
             uint8_t bit = timer_irq_bit(w);
             if (p->IRQEN & bit)
                 fire_irq(p, bit);
         }
         p->tcnt[w] -= cycles;
     }
+    serial_step(p, borrows);
 }
 
 /* ------------------------------------------------------------------ */
@@ -619,8 +632,15 @@ void ad_pokey_write(ad_pokey *p, uint8_t reg, uint8_t v)
             break;
         p->SKCTL = v;
         p->rng_enabled = (v & SK_INIT) != 0;
-        if (!p->rng_enabled)
+        if (!p->rng_enabled) {
             p->p4 = p->p5 = p->p9 = p->p17 = p->poly_adjust = 0;
+            /* Init also resets both serial state machines (SER_core.v's
+             * istate/ostate): a frame in flight is abandoned and the
+             * data register counts as taken. */
+            p->sdi_busy = false;
+            p->sdo_busy = false;
+            p->sdo_pending = false;
+        }
         break;
 
     case W_POTGO:
@@ -630,23 +650,31 @@ void ad_pokey_write(ad_pokey *p, uint8_t reg, uint8_t v)
         break;
 
     case W_SEROUT:
+        /* Into the output data register; the shifter takes it at its
+         * next bit clock (serial_step()).  A write over a byte the
+         * shifter has not taken yet replaces it, as on the chip. */
         p->SEROUT = v;
-        if (p->host && p->host->serial_out)
-            p->host->serial_out(p->host->ctx, v);
+        p->sdo_pending = true;
         break;
 
-    case W_IRQEN:
-        /* As AAE: clear any pending IRQST bits being disabled, then set
-         * the mask.  No timer scheduling here - the countdowns in
+    case W_IRQEN: {
+        /* Clear any pending IRQST bits being disabled, then set the
+         * mask.  No timer scheduling here - the countdowns in
          * ad_pokey_advance() run unconditionally; IRQEN only gates
-         * whether a borrow reaches fire_irq(). */
+         * whether a borrow reaches fire_irq().  Bit 3 is a level, not a
+         * latch: enabling it while the transmitter is idle asserts the
+         * IRQ at once. */
+        const uint8_t was = p->IRQEN;
         if (p->IRQST & (uint8_t)~v)
             p->IRQST &= v;
         p->IRQEN = v;
+        if ((v & ~was & IRQ_SEROC) && sdo_idle(p) && p->host && p->host->raise_irq)
+            p->host->raise_irq(p->host->ctx, IRQ_SEROC);
         break;
+    }
 
     case W_SKREST:
-        p->SKSTAT &= (uint8_t)~(ST_FRAME | ST_OVERRUN | ST_KBERR);
+        p->st_latch = 0;
         break;
 
     default:
@@ -724,14 +752,16 @@ uint8_t ad_pokey_read(ad_pokey *p, uint8_t reg)
     switch (a) {
     case R_RANDOM: return read_random(p);
     case R_ALLPOT: return allpot_read(p);
-    case R_IRQST:  return (uint8_t)(p->IRQST ^ 0xFF);
-    case R_SKSTAT: return p->SKSTAT;
-    case R_KBCODE:
-        p->kbd_pending = false;
-        return p->KBCODE;
-    case R_SERIN:
-        p->SKSTAT &= (uint8_t)~ST_SERIN_BUSY;
-        return p->SERIN;
+    case R_IRQST: {
+        /* Pending IRQs read as 0.  Bit 3 is not a latch: it is low
+         * whenever the transmitter is idle, whatever IRQEN says. */
+        uint8_t v = (uint8_t)(p->IRQST ^ 0xFF);
+        if (sdo_idle(p)) v &= (uint8_t)~IRQ_SEROC; else v |= IRQ_SEROC;
+        return v;
+    }
+    case R_SKSTAT: return skstat_read(p);
+    case R_KBCODE: return p->KBCODE;
+    case R_SERIN:  return p->SERIN;
     default:
         /* POT0-7 share offsets 0x00-0x07 with AUDF1-4/AUDC1-4's write
          * side; on the read side they are the only registers there. */
@@ -747,69 +777,201 @@ uint8_t ad_pokey_read(ad_pokey *p, uint8_t reg)
 /* ------------------------------------------------------------------ */
 /* Keyboard                                                            */
 /* ------------------------------------------------------------------ */
-/* As AAE's keyboard_key(): scanning requires the SKCTL init bits set
- * (not in reset), same gate as the RNG/timers.  A key-down while a prior
- * code is still unread sets ST_KBERR (overrun) rather than silently
- * replacing it; W_SKREST clears ST_KBERR.  Key-up only ever clears
- * ST_KEYBD - it never touches KBCODE or fires an IRQ. */
+/* A key event from the host, standing in for the chip's matrix scan
+ * (KEY_core.v): the scanner only runs with SKCTL's scan-enable bit set.
+ * A new code latches into KBCODE and raises the keyboard IRQ; if that
+ * IRQ was still pending from the previous code, the keyboard overrun
+ * latch sets (IRQ_core.v: keyOvrun = setKey & the pending latch) -
+ * nothing on the chip knows whether KBCODE was read, only whether its
+ * IRQ was cleared.  SKSTAT's key-down and shift-key bits follow the
+ * matrix live, so they come from every call, up or down. */
 void ad_pokey_keyboard_key(ad_pokey *p, uint8_t code, uint8_t flags, bool down)
 {
-    if ((p->SKCTL & SK_INIT) == 0)
+    if ((p->SKCTL & SK_KEYSCAN) == 0)
         return;
+    p->kb_shift = (flags & ST_SHIFT) != 0;
     if (!down) {
-        p->SKSTAT &= (uint8_t)~ST_KEYBD;
+        p->kb_down = false;
         return;
     }
-    if (p->kbd_pending)
-        p->SKSTAT |= ST_KBERR;
+    if (p->IRQST & IRQ_KEYBD)
+        p->st_latch |= ST_KBERR;
     p->KBCODE = code;
-    p->SKSTAT |= ST_KEYBD;
-    if (flags & ST_SHIFT)
-        p->SKSTAT |= ST_SHIFT;
-    else
-        p->SKSTAT &= (uint8_t)~ST_SHIFT;
-    p->kbd_pending = true;
+    p->kb_down = true;
     if (p->IRQEN & IRQ_KEYBD)
         fire_irq(p, IRQ_KEYBD);
 }
 
 /* ------------------------------------------------------------------ */
-/* Serial                                                              */
+/* Serial port                                                         */
 /* ------------------------------------------------------------------ */
-/* As AAE's serial_receive(): one byte in, no shift-register timing
- * modelled. */
-void ad_pokey_serial_receive(ad_pokey *p, uint8_t data)
+/* SER_core.v, a byte at a time.  Each direction is a ten-stage shift
+ * register (start bit, eight data bits LSB first, stop bit) clocked by
+ * a flop that toggles on a timer's borrow, so a bit is two borrows and
+ * a frame twenty.  SKCTL bits 4..6 pick the timers: the receiver clocks
+ * from timer 4 unless bits 5 and 4 are both clear (the external bit
+ * clock), the transmitter from timer 2 with bits 6 and 5 set, timer 4
+ * with either alone, the external clock with both clear.  No host here
+ * has an external clock, so a direction on it stands still.
+ *
+ * Transmit: the shifter takes the data register at its next bit clock
+ * and that load is the "output data needed" event (IRQ bit 4); twenty
+ * borrows later the stop bit has left the pin and the byte goes to the
+ * host.  A second SEROUT during a frame waits in the data register and
+ * loads straight after, so a stream is gapless.  "Transmission
+ * finished" (IRQ bit 3) is the idle level, see sdo_idle().
+ *
+ * Receive: a start bit is offered whenever the receiver is idle - the
+ * host's serial_in() from ad_pokey_advance(), or ad_pokey_serial_
+ * receive() directly.  In asynchronous mode (SKCTL bit 4) it resyncs
+ * timers 3 and 4, then twenty borrows later the stop bit is sampled:
+ * SERIN takes the byte, the input IRQ (bit 5) fires, and if that IRQ
+ * was still pending from the previous byte the overrun latch sets
+ * (IRQ_core.v: sdiOvrun = setSdiCompl & the pending latch).  SKSTAT's
+ * busy bit is low from the start bit to the stop bit, and its serial-
+ * data bit shows the level on the line.  A frame error needs a zero
+ * stop bit, which a byte interface cannot deliver, so that latch never
+ * sets here.  Not modelled either: the break bit, two-tone output. */
+
+enum { SER_FRAME_BORROWS = 20 };
+
+static int sdi_timer(const ad_pokey *p)
 {
-    p->SERIN = data;
-    p->SKSTAT |= ST_SERIN_BUSY;
+    return (p->SKCTL & 0x30) ? 2 : -1;
+}
+
+static int sdo_timer(const ad_pokey *p)
+{
+    switch (p->SKCTL & 0x60) {
+    case 0x00: return -1;
+    case 0x60: return 1;
+    default:   return 2;
+    }
+}
+
+static bool sdo_idle(const ad_pokey *p)
+{
+    return !p->sdo_busy && !p->sdo_pending;
+}
+
+/* The level on the serial input line: mark when idle, else the bit of
+ * the arriving frame that is on the wire now. */
+static bool sdi_line(const ad_pokey *p)
+{
+    if (!p->sdi_busy)
+        return true;
+    uint32_t bit = (SER_FRAME_BORROWS - p->sdi_left) / 2;
+    if (bit == 0) return false;                      /* start bit */
+    if (bit >= 9) return true;                       /* stop bit */
+    return ((p->sdi_byte >> (bit - 1)) & 1u) != 0;
+}
+
+static uint8_t skstat_read(const ad_pokey *p)
+{
+    uint8_t v = ST_ALWAYS_ONE;
+    if (!(p->st_latch & ST_FRAME))   v |= ST_FRAME;
+    if (!(p->st_latch & ST_OVERRUN)) v |= ST_OVERRUN;
+    if (!(p->st_latch & ST_KBERR))   v |= ST_KBERR;
+    if (sdi_line(p))                 v |= ST_SERIN_DATA;
+    if (!p->kb_shift)                v |= ST_SHIFT;
+    if (!p->kb_down)                 v |= ST_KEYBD;
+    if (!p->sdi_busy)                v |= ST_SERIN_BUSY;
+    return v;
+}
+
+static void sdi_start(ad_pokey *p, uint8_t data)
+{
+    p->sdi_busy = true;
+    p->sdi_byte = data;
+    p->sdi_left = SER_FRAME_BORROWS;
+    if (p->SKCTL & SK_ASYNC)
+        rearm_timer(p, 2);
+}
+
+static void sdi_complete(ad_pokey *p)
+{
+    p->sdi_busy = false;
+    p->SERIN = p->sdi_byte;
+    if (p->IRQST & IRQ_SERIN)
+        p->st_latch |= ST_OVERRUN;
     if (p->IRQEN & IRQ_SERIN)
         fire_irq(p, IRQ_SERIN);
+}
+
+/* One slice of serial time: borrows[w] is how many times timer w
+ * borrowed in the slice ad_pokey_advance() just walked. */
+static void serial_step(ad_pokey *p, const uint32_t *borrows)
+{
+    int ti = sdi_timer(p);
+    if (ti >= 0) {
+        if (!p->sdi_busy && p->host && p->host->serial_in) {
+            int b = p->host->serial_in(p->host->ctx);
+            if (b >= 0)
+                sdi_start(p, (uint8_t)b);
+        }
+        if (p->sdi_busy) {
+            if (borrows[ti] >= p->sdi_left)
+                sdi_complete(p);
+            else
+                p->sdi_left -= borrows[ti];
+        }
+    }
+
+    int to = sdo_timer(p);
+    if (to >= 0) {
+        uint32_t b = borrows[to];
+        while (b) {
+            if (!p->sdo_busy) {
+                if (!p->sdo_pending)
+                    break;
+                p->sdo_byte = p->SEROUT;                 /* the load, one borrow */
+                p->sdo_pending = false;
+                p->sdo_busy = true;
+                p->sdo_left = SER_FRAME_BORROWS;
+                --b;
+                if (p->IRQEN & IRQ_SEROR)
+                    fire_irq(p, IRQ_SEROR);
+                continue;
+            }
+            uint32_t take = b < p->sdo_left ? b : p->sdo_left;
+            p->sdo_left -= take;
+            b -= take;
+            if (p->sdo_left == 0) {
+                p->sdo_busy = false;
+                if (p->host && p->host->serial_out)
+                    p->host->serial_out(p->host->ctx, p->sdo_byte);
+                if (!p->sdo_pending && (p->IRQEN & IRQ_SEROC) && p->host && p->host->raise_irq)
+                    p->host->raise_irq(p->host->ctx, IRQ_SEROC);
+            }
+        }
+    }
+}
+
+/* A start bit from the host, outside the serial_in() poll.  Dropped if
+ * the receiver is busy (a line carries one frame at a time) or has no
+ * clock. */
+void ad_pokey_serial_receive(ad_pokey *p, uint8_t data)
+{
+    if (p->sdi_busy || sdi_timer(p) < 0)
+        return;
+    sdi_start(p, data);
 }
 
 /* ------------------------------------------------------------------ */
 /* Poll                                                                */
 /* ------------------------------------------------------------------ */
-/* The host's per-frame poll, driven by the host seam rather than by a
- * ROM register access: pulls one keyboard code through host->
- * keyboard_scan(), as AAE's scan_keyboard(), while the SKCTL init bits
- * are set.  AAE also declared serial_in() on PokeyHost but never called
- * it anywhere in Pokey - no driver polled for inbound serial data; this
- * port polls it here too, beside the keyboard, so a host with a serial
- * source has somewhere to feed it in. */
+/* The host's per-frame poll, standing in for the matrix scan: pulls one
+ * keyboard code through host->keyboard_scan() while the scanner is
+ * enabled.  (Serial input is not polled here - the receiver asks the
+ * host for a start bit itself, from ad_pokey_advance(), whenever it is
+ * idle and clocked.) */
 void ad_pokey_poll(ad_pokey *p)
 {
-    if ((p->SKCTL & SK_INIT) == 0 || !p->host)
+    if ((p->SKCTL & SK_KEYSCAN) == 0 || !p->host || !p->host->keyboard_scan)
         return;
-    if (p->host->keyboard_scan) {
-        uint8_t code = 0, flags = 0;
-        if (p->host->keyboard_scan(p->host->ctx, &code, &flags))
-            ad_pokey_keyboard_key(p, code, flags, true);
-    }
-    if (p->host->serial_in) {
-        int b = p->host->serial_in(p->host->ctx);
-        if (b >= 0)
-            ad_pokey_serial_receive(p, (uint8_t)b);
-    }
+    uint8_t code = 0, flags = 0;
+    if (p->host->keyboard_scan(p->host->ctx, &code, &flags))
+        ad_pokey_keyboard_key(p, code, flags, true);
 }
 
 /* ------------------------------------------------------------------ */

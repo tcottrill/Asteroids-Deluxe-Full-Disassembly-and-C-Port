@@ -601,14 +601,19 @@ static void check_silence(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* (11) IRQ timers, keyboard, serial, pots                             */
+/* (11) IRQ timers, keyboard and SKSTAT, the serial port, pots          */
 /* ------------------------------------------------------------------ */
 /* A host stub that records every callback the chip can make, so this
  * check drives ad_pokey_write()/read()/advance()/keyboard_key()/
  * serial_receive()/poll() through the same ad_pokey_host seam a real
  * host uses, rather than reaching into the chip directly.  th is a
  * fresh static struct per check_host_seam() call (there's only one, but
- * memset at the top keeps it that way if that changes). */
+ * memset at the top keeps it that way if that changes).  The serial
+ * expectations are the chip's: two borrows of the selected timer per
+ * bit, ten bits per frame, the load of the shifter as the "data needed"
+ * event, the idle level as "transmission finished", and an overrun
+ * being a byte that completes while the previous one's IRQ is still
+ * pending (SER_core.v, IRQ_core.v, SKSTAT_reg.v). */
 static struct {
     uint8_t irq_mask;             /* OR of every raise_irq() mask seen */
     int     irq_calls;
@@ -681,16 +686,18 @@ static void check_host_seam(void)
 
     ad_pokey_advance(&chip, 27);
     CHECK(th.irq_calls == 0, "timer1: no IRQ after 27 of 28 cycles, got %d call(s)", th.irq_calls);
+    /* IRQST bit 3 is the transmitter's idle level, low on a quiet chip,
+     * so an idle chip reads 0xF7 - the timer reads below look past it. */
     uint8_t irqst = ad_pokey_read(&chip, R_IRQST);
-    CHECK(irqst == 0xFF, "timer1: R_IRQST should read 0xFF before the first borrow, got %02X", irqst);
+    CHECK(irqst == (uint8_t)~IRQ_SEROC, "timer1: R_IRQST should read 0xF7 before the first borrow, got %02X", irqst);
 
     ad_pokey_advance(&chip, 1);            /* the 28th cycle: the borrow fires */
     CHECK(th.irq_calls == 1 && th.irq_mask == IRQ_TIMR1,
           "timer1: raise_irq(0x01) should fire at cycle 28, got %d call(s), mask %02X",
           th.irq_calls, th.irq_mask);
     irqst = ad_pokey_read(&chip, R_IRQST);
-    CHECK(irqst == (uint8_t)~IRQ_TIMR1,
-          "timer1: R_IRQST should read 0xFE (bit 0 set) after the borrow, got %02X", irqst);
+    CHECK(irqst == (uint8_t)~(IRQ_TIMR1 | IRQ_SEROC),
+          "timer1: R_IRQST should read 0xF6 (bit 0 low) after the borrow, got %02X", irqst);
 
     ad_pokey_advance(&chip, 28 * 5);       /* five more periods in one slice: IRQST is a latch */
     CHECK(th.irq_calls == 2, "timer1: a slice spanning several periods should still call raise_irq() once, got %d total",
@@ -699,7 +706,7 @@ static void check_host_seam(void)
 
     ad_pokey_write(&chip, W_IRQEN, 0);     /* disabling clears the pending IRQST bit */
     irqst = ad_pokey_read(&chip, R_IRQST);
-    CHECK(irqst == 0xFF, "timer1: IRQEN=0 should clear IRQST, R_IRQST should read 0xFF, got %02X", irqst);
+    CHECK(irqst == (uint8_t)~IRQ_SEROC, "timer1: IRQEN=0 should clear IRQST, R_IRQST should read 0xF7, got %02X", irqst);
 
     int calls_before_gate = th.irq_calls;
     ad_pokey_advance(&chip, 200);          /* the timer keeps counting; IRQEN=0 only gates the callback */
@@ -785,69 +792,164 @@ static void check_host_seam(void)
           "release: the slow-clock timer's borrow lands on the 28th cycle, got %d new call(s)",
           th.irq_calls - calls_before_held);
 
-    /* --- keyboard --- */
+    /* --- keyboard and SKSTAT ---
+     * SKSTAT reads every condition as a 0 and bit 0 as a 1, so an idle
+     * chip reads 0xFF.  A keyboard overrun is the chip's rule: a new
+     * code while the keyboard IRQ is still pending in IRQST - reading
+     * KBCODE clears nothing, writing IRQEN does. */
+    uint8_t st = ad_pokey_read(&chip, R_SKSTAT);
+    CHECK(st == 0xFF, "SKSTAT idle should read 0xFF (all conditions clear, bit 0 high), got %02X", st);
     ad_pokey_write(&chip, W_IRQEN, IRQ_KEYBD);
     th.irq_calls = 0; th.irq_mask = 0;
     ad_pokey_keyboard_key(&chip, 0x21, ST_SHIFT, true);
     CHECK(th.irq_calls == 1 && th.irq_mask == IRQ_KEYBD,
           "keyboard: key down with IRQEN=IRQ_KEYBD should raise 0x40, got %d call(s), mask %02X",
           th.irq_calls, th.irq_mask);
-    CHECK((chip.SKSTAT & (ST_KEYBD | ST_SHIFT)) == (ST_KEYBD | ST_SHIFT),
-          "keyboard: SKSTAT should have ST_KEYBD|ST_SHIFT set, got %02X", chip.SKSTAT);
-    CHECK(chip.KBCODE == 0x21, "keyboard: KBCODE should latch 0x21, got %02X", chip.KBCODE);
+    st = ad_pokey_read(&chip, R_SKSTAT);
+    CHECK(st == (uint8_t)(0xFF & ~(ST_KEYBD | ST_SHIFT)),
+          "keyboard: SKSTAT should read key-down and shift as zeros (0xF3), got %02X", st);
+    CHECK(ad_pokey_read(&chip, R_KBCODE) == 0x21, "keyboard: KBCODE should latch 0x21, got %02X", chip.KBCODE);
 
-    /* A second key before KBCODE is read finds the prior code still
-     * pending and sets the overrun bit, ST_KBERR. */
-    ad_pokey_keyboard_key(&chip, 0x22, 0, true);
-    CHECK((chip.SKSTAT & ST_KBERR) != 0, "keyboard: a second key before the read should set ST_KBERR, got %02X",
-          chip.SKSTAT);
+    ad_pokey_keyboard_key(&chip, 0x22, 0, true);   /* IRQ still pending: overrun */
+    st = ad_pokey_read(&chip, R_SKSTAT);
+    CHECK((st & ST_KBERR) == 0, "keyboard: a second code with the IRQ pending should read overrun (bit 5 low), got %02X", st);
+    CHECK((st & ST_SHIFT) != 0, "keyboard: shift released should read bit 3 high, got %02X", st);
+    CHECK(ad_pokey_read(&chip, R_KBCODE) == 0x22, "keyboard: KBCODE should hold the second code");
 
     ad_pokey_write(&chip, W_SKREST, 0);
-    CHECK((chip.SKSTAT & ST_KBERR) == 0, "keyboard: SKREST should clear ST_KBERR, got %02X", chip.SKSTAT);
+    st = ad_pokey_read(&chip, R_SKSTAT);
+    CHECK((st & ST_KBERR) != 0, "keyboard: SKREST should clear the overrun latch, got %02X", st);
 
-    uint8_t kb = ad_pokey_read(&chip, R_KBCODE);   /* R_KBCODE also clears kbd_pending */
-    CHECK(kb == 0x22, "keyboard: R_KBCODE should read the still-latched second code, got %02X", kb);
+    ad_pokey_write(&chip, W_IRQEN, 0);             /* clears the pending keyboard IRQ */
+    ad_pokey_write(&chip, W_IRQEN, IRQ_KEYBD);
+    ad_pokey_keyboard_key(&chip, 0x23, 0, true);   /* no IRQ pending: no overrun */
+    st = ad_pokey_read(&chip, R_SKSTAT);
+    CHECK((st & ST_KBERR) != 0, "keyboard: a code with no IRQ pending is not an overrun, got %02X", st);
 
-    ad_pokey_keyboard_key(&chip, 0x22, 0, false);  /* key up */
-    CHECK((chip.SKSTAT & ST_KEYBD) == 0, "keyboard: key up should clear ST_KEYBD, got %02X", chip.SKSTAT);
+    ad_pokey_keyboard_key(&chip, 0x23, 0, false);  /* key up */
+    st = ad_pokey_read(&chip, R_SKSTAT);
+    CHECK((st & ST_KEYBD) != 0, "keyboard: key up should read bit 2 high, got %02X", st);
 
-    ad_pokey_write(&chip, W_SKCTL, 0);             /* held: keyboard_key must be ignored */
-    uint8_t skstat_before = chip.SKSTAT;
+    ad_pokey_write(&chip, W_SKCTL, 0x05);          /* scanner off (bit 1 clear), chip not held */
     ad_pokey_keyboard_key(&chip, 0x33, 0, true);
-    CHECK(chip.SKSTAT == skstat_before, "keyboard: keyboard_key while SKCTL=0 should be ignored, got %02X (was %02X)",
-          chip.SKSTAT, skstat_before);
-    ad_pokey_write(&chip, W_SKCTL, 7);             /* release again */
+    CHECK(ad_pokey_read(&chip, R_KBCODE) == 0x23 && (ad_pokey_read(&chip, R_SKSTAT) & ST_KEYBD) != 0,
+          "keyboard: a key with the scanner disabled should be ignored");
+    ad_pokey_write(&chip, W_SKCTL, 7);
 
-    /* --- serial --- */
-    ad_pokey_write(&chip, W_IRQEN, IRQ_SERIN);
-    th.irq_calls = 0; th.irq_mask = 0;
-    ad_pokey_serial_receive(&chip, 0x5A);
-    CHECK(th.irq_calls == 1 && th.irq_mask == IRQ_SERIN,
-          "serial: serial_receive with IRQEN=IRQ_SERIN should raise 0x20, got %d call(s), mask %02X",
-          th.irq_calls, th.irq_mask);
-    CHECK((chip.SKSTAT & ST_SERIN_BUSY) != 0, "serial: SKSTAT should have ST_SERIN_BUSY set, got %02X", chip.SKSTAT);
-
-    uint8_t sv = ad_pokey_read(&chip, R_SERIN);
-    CHECK(sv == 0x5A, "serial: R_SERIN should read 0x5A, got %02X", sv);
-    CHECK((chip.SKSTAT & ST_SERIN_BUSY) == 0, "serial: R_SERIN read should clear ST_SERIN_BUSY, got %02X", chip.SKSTAT);
+    /* --- serial output ---
+     * SKCTL bit 5 alone: both directions clock from timer 4.  Channels
+     * 3+4 joined on the fast clock with AUDF3=$28, AUDF4=0 give a 47-
+     * cycle borrow (the Atari's 19200 baud setting at 1.79 MHz): a bit
+     * is 94 cycles, a frame 940.  The last AUDF write re-armed timer 4,
+     * so its first borrow is 47 cycles after the SEROUT below. */
+    ad_pokey_write(&chip, W_AUDCTL, CTL_CH34_JOIN | CTL_CH3_HICLK);
+    ad_pokey_write(&chip, W_AUDF3, 0x28);
+    ad_pokey_write(&chip, W_AUDF4, 0x00);
+    ad_pokey_write(&chip, W_SKCTL, 0x27);
+    CHECK(chip.divisor[3] == 47, "serial setup: channel 4's divisor should be 47, got %u", (unsigned)chip.divisor[3]);
+    th.irq_calls = 0; th.irq_mask = 0; th.serout_calls = 0;
+    ad_pokey_write(&chip, W_IRQEN, IRQ_SEROR | IRQ_SEROC | IRQ_SERIN);
+    CHECK(th.irq_mask == IRQ_SEROC, "serial: enabling bit 3 with the transmitter idle asserts it at once, got mask %02X", th.irq_mask);
+    CHECK((ad_pokey_read(&chip, R_IRQST) & IRQ_SEROC) == 0, "serial: IRQST bit 3 should read 0 while idle");
 
     ad_pokey_write(&chip, W_SEROUT, 0xA5);
+    th.irq_mask = 0;
+    CHECK((ad_pokey_read(&chip, R_IRQST) & IRQ_SEROC) != 0, "serial: IRQST bit 3 should read 1 once a byte is waiting");
+    ad_pokey_advance(&chip, 46);
+    CHECK(th.irq_mask == 0, "serial: nothing happens before the next borrow, got mask %02X", th.irq_mask);
+    ad_pokey_advance(&chip, 1);                    /* the borrow: the shifter takes the byte */
+    CHECK(th.irq_mask == IRQ_SEROR, "serial: the load should raise 'output data needed' (0x10), got mask %02X", th.irq_mask);
+    CHECK((ad_pokey_read(&chip, R_IRQST) & IRQ_SEROR) == 0, "serial: IRQST bit 4 should read 0 after the load");
+    CHECK(th.serout_calls == 0, "serial: the byte has not left the pin yet");
+    th.irq_mask = 0;
+    ad_pokey_advance(&chip, 20 * 47 - 1);
+    CHECK(th.serout_calls == 0, "serial: one cycle short of twenty borrows the byte is still going out");
+    ad_pokey_advance(&chip, 1);
     CHECK(th.serout_calls == 1 && th.serout_byte == 0xA5,
-          "serial: W_SEROUT should call serial_out(0xA5), got %d call(s), byte %02X",
+          "serial: serial_out(0xA5) at the twentieth borrow, got %d call(s), byte %02X", th.serout_calls, th.serout_byte);
+    CHECK(th.irq_mask == IRQ_SEROC, "serial: going idle should raise 'transmission finished' (0x08), got mask %02X", th.irq_mask);
+    CHECK((ad_pokey_read(&chip, R_IRQST) & IRQ_SEROC) == 0, "serial: IRQST bit 3 back to 0 when idle");
+
+    /* Double buffering: a byte written during a frame loads right
+     * after it, so a stream has no gap; a byte written over a waiting
+     * byte replaces it. */
+    ad_pokey_write(&chip, W_SEROUT, 0x11);
+    ad_pokey_write(&chip, W_SEROUT, 0x3C);         /* replaces 0x11 before any borrow */
+    ad_pokey_advance(&chip, 47);                   /* load 0x3C */
+    ad_pokey_write(&chip, W_SEROUT, 0x5A);         /* waits in the data register */
+    th.irq_mask = 0;
+    ad_pokey_advance(&chip, 20 * 47);              /* 0x3C out */
+    CHECK(th.serout_calls == 2 && th.serout_byte == 0x3C, "serial: 0x3C should be the second byte out, got %d call(s), %02X",
+          th.serout_calls, th.serout_byte);
+    CHECK((th.irq_mask & IRQ_SEROC) == 0 && (ad_pokey_read(&chip, R_IRQST) & IRQ_SEROC) != 0,
+          "serial: with 0x5A waiting the transmitter is not finished");
+    ad_pokey_advance(&chip, 47);                   /* load 0x5A */
+    CHECK((th.irq_mask & IRQ_SEROR) != 0, "serial: loading the waiting byte raises 'output data needed' again");
+    ad_pokey_advance(&chip, 20 * 47);
+    CHECK(th.serout_calls == 3 && th.serout_byte == 0x5A, "serial: 0x5A should follow with no gap, got %d call(s), %02X",
           th.serout_calls, th.serout_byte);
 
-    /* --- poll: one keyboard code and one serial byte per call --- */
+    /* --- serial input ---
+     * Asynchronous mode (bit 4): the start bit re-arms timer 4, so the
+     * frame is exactly twenty borrows from the moment the receiver
+     * takes it.  The host's byte is picked up by the next advance. */
+    ad_pokey_write(&chip, W_SKCTL, 0x37);
+    th.serial_byte_queued = 0x66;                  /* 0110 0110, LSB first: 0 1 1 0 0 1 1 0 */
+    th.irq_mask = 0;
+    ad_pokey_advance(&chip, 1);
+    CHECK(th.serial_byte_queued == -1, "serial in: the idle receiver should take the host's byte");
+    st = ad_pokey_read(&chip, R_SKSTAT);
+    CHECK((st & ST_SERIN_BUSY) == 0 && (st & ST_SERIN_DATA) == 0,
+          "serial in: during the start bit SKSTAT reads busy (bit 1 low) and the line low (bit 4), got %02X", st);
+    ad_pokey_advance(&chip, 94);                   /* data bit 0 of 0x66 = 0 */
+    CHECK((ad_pokey_read(&chip, R_SKSTAT) & ST_SERIN_DATA) == 0, "serial in: data bit 0 of 0x66 is low on the line");
+    ad_pokey_advance(&chip, 94);                   /* data bit 1 = 1 */
+    CHECK((ad_pokey_read(&chip, R_SKSTAT) & ST_SERIN_DATA) != 0, "serial in: data bit 1 of 0x66 is high on the line");
+    ad_pokey_advance(&chip, 16 * 47 - 1);
+    CHECK(chip.SERIN != 0x66 && th.irq_mask == 0, "serial in: one cycle short of the stop bit nothing has landed");
+    ad_pokey_advance(&chip, 1);
+    CHECK(ad_pokey_read(&chip, R_SERIN) == 0x66, "serial in: SERIN should hold 0x66 at the stop bit, got %02X", chip.SERIN);
+    CHECK(th.irq_mask == IRQ_SERIN, "serial in: the stop bit should raise the input IRQ (0x20), got mask %02X", th.irq_mask);
+    st = ad_pokey_read(&chip, R_SKSTAT);
+    CHECK((st & (ST_SERIN_BUSY | ST_SERIN_DATA | ST_OVERRUN)) == (ST_SERIN_BUSY | ST_SERIN_DATA | ST_OVERRUN),
+          "serial in: idle again, line at mark, no overrun, got %02X", st);
+
+    /* Overrun: the next byte completes while the input IRQ is still
+     * pending. */
+    th.serial_byte_queued = 0x77;
+    ad_pokey_advance(&chip, 1);
+    ad_pokey_advance(&chip, 20 * 47);
+    st = ad_pokey_read(&chip, R_SKSTAT);
+    CHECK(ad_pokey_read(&chip, R_SERIN) == 0x77 && (st & ST_OVERRUN) == 0,
+          "serial in: a byte landing on a pending IRQ should read overrun (bit 6 low), got SERIN %02X SKSTAT %02X",
+          chip.SERIN, st);
+    ad_pokey_write(&chip, W_SKREST, 0);
+    CHECK((ad_pokey_read(&chip, R_SKSTAT) & ST_OVERRUN) != 0, "serial in: SKREST clears the overrun latch");
+
+    /* ad_pokey_serial_receive(): a start bit from the host directly;
+     * refused while a frame is in progress. */
+    ad_pokey_serial_receive(&chip, 0x88);
+    CHECK((ad_pokey_read(&chip, R_SKSTAT) & ST_SERIN_BUSY) == 0, "serial in: serial_receive on an idle receiver starts a frame");
+    ad_pokey_serial_receive(&chip, 0x99);          /* dropped: busy */
+    ad_pokey_advance(&chip, 20 * 47);
+    CHECK(ad_pokey_read(&chip, R_SERIN) == 0x88, "serial in: the frame in progress wins, got %02X", chip.SERIN);
+
+    /* External clock modes have no clock here: nothing moves. */
+    ad_pokey_write(&chip, W_SKCTL, 0x07);
+    th.serout_calls = 0;
+    ad_pokey_serial_receive(&chip, 0xAA);
+    ad_pokey_write(&chip, W_SEROUT, 0xBB);
+    ad_pokey_advance(&chip, 3000);
+    CHECK(th.serout_calls == 0 && ad_pokey_read(&chip, R_SERIN) == 0x88,
+          "serial: on the external bit clock neither direction moves");
+    ad_pokey_write(&chip, W_IRQEN, 0);
+
+    /* --- poll: one keyboard code per call --- */
     th.kbd_code_queued = 0x55;
-    th.serial_byte_queued = 0x66;
     ad_pokey_poll(&chip);
-    CHECK(chip.KBCODE == 0x55 && (chip.SKSTAT & ST_KEYBD) != 0,
-          "poll: should pull the queued keyboard code through keyboard_scan, got KBCODE=%02X SKSTAT=%02X",
-          chip.KBCODE, chip.SKSTAT);
-    CHECK(chip.SERIN == 0x66 && (chip.SKSTAT & ST_SERIN_BUSY) != 0,
-          "poll: should pull the queued serial byte through serial_in, got SERIN=%02X SKSTAT=%02X",
-          chip.SERIN, chip.SKSTAT);
-    CHECK(th.kbd_code_queued == -1 && th.serial_byte_queued == -1,
-          "poll: should consume both queued items in one call");
+    CHECK(chip.KBCODE == 0x55 && (ad_pokey_read(&chip, R_SKSTAT) & ST_KEYBD) == 0,
+          "poll: should pull the queued keyboard code through keyboard_scan, got KBCODE=%02X", chip.KBCODE);
+    CHECK(th.kbd_code_queued == -1, "poll: should consume the queued code");
 
     /* --- pots --- */
     uint8_t pv = ad_pokey_read(&chip, R_POT0 + 3);
