@@ -97,6 +97,7 @@ test_objects.exe --probe
 | `tests/probe_*.c` | per-module checks, built with `tests/build_mod.bat <module>` |
 | `tests/stubs.c` | empty; the staging hook `build_mod.bat` keeps |
 | `tests/build_test.bat`, `tests/build_mod.bat` | the headless build, and one module against the probe harness |
+| `tests/build_dvg_test.bat`, `tests/dvg_test.c`, `tests/dvg_ref.c` | records vector RAM dumps with `--dumpall`, then checks `dvg.c` (MAME's DVG state machine) frame by frame against the old float walker |
 | `CONVENTIONS.md` | **read this before adding code** |
 
 ## The memory model is generated, not typed

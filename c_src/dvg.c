@@ -105,11 +105,12 @@ static void dvg_vggo(void);
 static void dvg_vgrst(void);
 
 /* dvg_data (update_databus): "DVG uses low bit of state for address."
- * The unified $4000-$57FF vector RAM/ROM address is 0x4000 +
+ * The unified $4000-$5FFF vector RAM/ROM address is 0x4000 +
  * ((pc<<1) | (state_latch&1)); below $4800 it's vector RAM
- * (g.vram), at/above $4800 it's the vector ROM (ad_rom()). MAME reads
+ * (g.vram), at/above $4800 it's the vector ROM (ad_rom(), populated
+ * to $57FF on this board; ad_rom() reads 0 above that). MAME reads
  * both out of one contiguous "vectorram" share; this port's g.vram and
- * ad_rom() together are that same contiguous $4000-$57FF range. */
+ * ad_rom() together are that same contiguous range. */
 static void dvg_update_databus(void)
 {
     uint16_t addr = (uint16_t)(0x4000u + (((uint32_t)dv.pc << 1) | (dv.state_latch & 1u)));

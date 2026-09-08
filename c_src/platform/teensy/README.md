@@ -112,8 +112,10 @@ Teensy starts with an empty table, same as a fresh ER2055.
 
 ## How it works
 
-`dvg.c` walks the display list the game built and hands every lit segment
-to `plat_video_line`, which maps it to DAC codes (DVG 0..1023 shifted onto
+`dvg.c` runs the display list the game built through the DVG's own state
+machine (MAME's model: the 034602-01 PROM, 12-bit integer beam counters
+stepped by the 7497 rate multipliers, blanking on counter bit 10) and hands
+every lit segment to `plat_video_line`, which maps it to DAC codes (DVG 0..1023 shifted onto
 the 12-bit DAC, so 512 is mid-scale, exactly the stock board's geometry)
 into a per-frame buffer. `plat_video_present` draws the buffer synchronously:
 blanked moves in `VEC_MOVE_STEP` counts, lit segments in `VEC_DRAW_STEP`

@@ -6,7 +6,7 @@ nothing outside it, so the platform-agnostic game core is copied into
 astdelux_teensy/src/core/ (gitignored) rather than referenced in place.  The
 file list is the second `cl` line of c_src/build_win_gl.bat minus the Windows
 backend (platform/windows/plat_win.c): app_win.c is the platform-agnostic
-application loop despite its name, dvg.c the display-list walker.
+application loop despite its name, dvg.c the DVG state machine.
 
 The five samples in c_src/samples/astdelux.zip (8-bit unsigned mono 44100 Hz)
 become const arrays in src/samples_data.c so the board needs no SD card.
