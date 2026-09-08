@@ -26,10 +26,12 @@ int  plat_init(void);      /* window/audio up; 0 = ok, nonzero = fail */
 void plat_shutdown(void);
 
 /* ---- video: the segment sink -------------------------------------------
- * The DVG walker (dvg.c) emits every lit segment through plat_video_line
- * in DVG beam space (x 0..1040, y 70..950 visible, y up), z = the intensity
- * nibble 0..15 as the display list carries it.  A zero-length segment
- * is a dot.  A raster backend draws between begin/present. */
+ * The DVG state machine (dvg.c) emits every lit segment through
+ * plat_video_line in DVG beam space: the hardware blanks any beam
+ * position with bit 10 set, so x and y are 0..1023, y up.  This Windows
+ * host shows x 0..1040, y 70..950 of that.  z = the intensity nibble
+ * 0..15 as the display list carries it.  A zero-length segment is a
+ * dot.  A raster backend draws between begin/present. */
 void plat_video_begin(void);                    /* start of frame / clear */
 void plat_video_line(float x0, float y0, float x1, float y1, int z);
 void plat_video_present(void);                  /* flip */

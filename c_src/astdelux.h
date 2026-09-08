@@ -394,6 +394,14 @@ void ad_pkytst(void);                       /* PKYTST $7FC1  also sets RVELP/M *
 void ad_protck(void);                       /* START2_12 $604B checksum slice */
 
 /* ------------------------------------------------------------------ */
+/* dvg.c                                                               */
+/* ------------------------------------------------------------------ */
+int  dvg_render(void);                      /* run the display list from GO
+                                             *   to HALT; 0 clean, 2 runaway */
+unsigned long dvg_last_cycles(void);        /* master-clock cycles GO..HALT
+                                             *   became visible, last call */
+
+/* ------------------------------------------------------------------ */
 /* stest.c  (DSTTST.MAC, from PWRON through SWCH)                      */
 /* ------------------------------------------------------------------ */
 void ad_stest3(void);                       /* STEST3 $7DF3  ROM checksum,

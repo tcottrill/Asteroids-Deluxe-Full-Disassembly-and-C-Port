@@ -27,8 +27,6 @@
 #include "er2055.h"
 #include "platform/ad_platform.h"
 
-extern int dvg_render(void);
-
 /* The NMI period.  The board's is 4 ms (3 kHz / 12), four to a frame,
  * so 62.5 frames a second.  ad_app_set_frame_rate() lets a host ask
  * for another rate - 60 Hz to match a 60 Hz monitor - by stretching
