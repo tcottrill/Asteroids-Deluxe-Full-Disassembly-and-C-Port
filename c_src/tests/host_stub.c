@@ -8,19 +8,24 @@
  * input and a renderer that interprets g.vram as a display list
  * (disasm/vramview.py does that offline).
  *
- *     astdelux_test [frames] [--dump file] [--start] [--fire] [--thrust]
- *                   [--rotl] [--shield] [--test] [--probe] [--nv file]
- *                   [--rev3]
+ *     astdelux_test [frames] [--dump file] [--dumpall file] [--start]
+ *                   [--fire] [--thrust] [--rotl] [--shield] [--test]
+ *                   [--probe] [--nv file] [--rev3]
  *
  * --start presses player 1 START for a few frames early on; the other
  * switches are held from frame 8 on.  --test holds the cabinet
  * self-test switch instead of running the game: STEST3 runs once, then
  * `frames` passes of the self-test display loop.  --dump writes vector
- * RAM at the end for vramview.py.  --nv <file> loads the EAROM's 64-byte
- * image from `file` before the run (a missing file leaves the image
- * zero-filled, same as a fresh chip on this board) and writes it back to
- * `file` at the end, so a play-through's high-score persistence can be
- * checked across two runs from the command line.
+ * RAM at the end for vramview.py.  --dumpall <file> appends one
+ * 2304-byte record - 256 bytes of zero page (g.zp.raw) then the 2048
+ * bytes of vector RAM (g.vram) - on every ad_hw_vg_go() kick, in both
+ * the game loop and --test mode; frame N's vector RAM then sits at byte
+ * offset N*2304+256 of the file (see tests/dvg_test.c, which replays a
+ * DVG state machine against these dumps).  --nv <file> loads the
+ * EAROM's 64-byte image from `file` before the run (a missing file
+ * leaves the image zero-filled, same as a fresh chip on this board) and
+ * writes it back to `file` at the end, so a play-through's high-score
+ * persistence can be checked across two runs from the command line.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,7 +161,30 @@ uint8_t ad_hw_earom_read(void)        { return ad_er2055_data(&earom); }
 void    ad_hw_earom_write(uint8_t addr, uint8_t data)
                                        { ad_er2055_set_addr_data(&earom, addr, data); }
 void    ad_hw_earom_ctl(uint8_t v)    { ad_er2055_control(&earom, v); }
-void    ad_hw_vg_go(void)             { frames++; }
+
+/* --dumpall: appended to on every kick, game loop or self-test alike
+ * (both call ad_hw_vg_go() - see mainline.c and stest.c).  sizeof
+ * g.zp.raw is exactly 256 bytes (ad_zp_t is a union of the named fields
+ * and a raw[0x100] array - astdelux_state.h) and g.vram is exactly
+ * AD_VRAM_SIZE == 2048 bytes, so each record is exactly 2304 bytes. */
+static FILE *dumpall_file = NULL;
+
+static void close_dumpall(void)
+{
+    if (dumpall_file) {
+        fclose(dumpall_file);
+        dumpall_file = NULL;
+    }
+}
+
+void ad_hw_vg_go(void)
+{
+    frames++;
+    if (dumpall_file) {
+        fwrite(g.zp.raw, 1, sizeof g.zp.raw, dumpall_file);
+        fwrite(g.vram, 1, sizeof g.vram, dumpall_file);
+    }
+}
 bool    ad_hw_vg_busy(void)           { return false; }
 void    ad_hw_vg_reset(void)          { }
 void    ad_hw_watchdog(void)          { }
@@ -213,6 +241,7 @@ int main(int argc, char **argv)
 {
     unsigned want = 60;
     const char *dump = NULL;
+    const char *dumpall = NULL;
     const char *nv = NULL;
 
     /* Live before anything else runs, including a probe: ad_pwron() (a
@@ -232,6 +261,8 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dump") && i + 1 < argc)
             dump = argv[++i];
+        else if (!strcmp(argv[i], "--dumpall") && i + 1 < argc)
+            dumpall = argv[++i];
         else if (!strcmp(argv[i], "--nv") && i + 1 < argc)
             nv = argv[++i];
         else if (!strcmp(argv[i], "--start"))  opt_start = true;
@@ -251,6 +282,15 @@ int main(int argc, char **argv)
 #endif
         } else
             want = (unsigned)strtoul(argv[i], NULL, 0);
+    }
+
+    if (dumpall) {
+        dumpall_file = fopen(dumpall, "wb");
+        if (!dumpall_file) {
+            perror(dumpall);
+            return 1;
+        }
+        atexit(close_dumpall);
     }
 
     if (nv)

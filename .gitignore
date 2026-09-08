@@ -44,6 +44,7 @@ c_src/obj/
 c_src/tests/obj/
 c_src/tests/obj_*/
 c_src/tests/*.bin
+c_src/tests/*.dump
 c_src/tests/*.html
 c_src/*.log
 c_src/*.nv
