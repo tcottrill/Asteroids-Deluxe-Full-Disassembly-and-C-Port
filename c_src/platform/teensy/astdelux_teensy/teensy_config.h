@@ -1,7 +1,7 @@
 /* teensy_config.h - every hardware and tuning constant of the Teensy 4.1
- * backend for the Masteroids-class replica board (the KiCad project in
- * "Masteroids Replica"; pin numbers are the schematic's net labels on the
- * Teensy symbol).  Plain C: this header is also compiled into the PC
+ * backend for the Teensy Vector Emulation PCB (pin numbers are the
+ * schematic's net labels on the Teensy symbol).  Plain C: this header is
+ * also compiled into the PC
  * probe (tests/probe_teensy.c), so no Arduino names outside #ifdef ARDUINO.
  *
  * Beam and audio values marked TUNE are starting points for bring-up, not

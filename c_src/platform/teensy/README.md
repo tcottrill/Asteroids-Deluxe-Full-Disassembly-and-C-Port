@@ -1,7 +1,7 @@
 # Teensy 4.1 backend
 
-The C port running standalone on the Teensy 4.1 of the Masteroids-class
-replica board: X/Y out through two DAC7811s, intensity through the 5-bit
+The C port running standalone on the Teensy 4.1 on the Teensy Vector Emulation
+PCB: X/Y out through two DAC7811s, intensity through the 5-bit
 resistor ladder, sound through the PT8211, the cabinet's switches and
 start lamps through the 44-pin edge connector. No PC, no SD card.
 
@@ -29,7 +29,7 @@ summarised in the comments of `astdelux_teensy/teensy_config.h`.
 ## Wiring
 
 Pins are the schematic's net labels on the Teensy symbol
-(`masteroids_replica.kicad_sch`). Switches close to ground and use the
+(the PCB's KiCad schematic). Switches close to ground and use the
 Teensy's pull-ups.
 
 | Teensy | net | |

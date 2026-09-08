@@ -1,5 +1,5 @@
 /* astdelux_teensy.ino - Asteroids Deluxe, the C port, standalone on the
- * Teensy 4.1 of the Masteroids-class replica board.
+ * Teensy 4.1 on the Teensy Vector Emulation PCB.
  *
  * Build: run ..\build_teensy.bat (stage.py copies the game core into src/,
  * then arduino-cli compiles for Teensy 4.1 at 816 MHz, Fastest), or open
