@@ -34,13 +34,15 @@ atari_pokey-main/
 # C conversion build output
 c_src/obj/
 *.exe
+!c_src/astdelux_win.exe
 *.obj
 *.pdb
 *.ilk
 
 # The test builds (c_src/tests) and the hosts' runtime output.  The window
 # host writes astdelux_win.ini itself with every key at its default on
-# the first run, so a local copy carries the user's own settings.
+# the first run; the tracked copy and astdelux_win.exe are the published
+# defaults and build.
 c_src/tests/obj/
 c_src/tests/obj_*/
 c_src/tests/*.bin
@@ -50,7 +52,6 @@ c_src/*.log
 c_src/*.nv
 c_src/*.bin
 c_src/*.html
-c_src/astdelux_win.ini
 
 # The Teensy backend's sketch: stage.py copies the game core and the
 # converted samples into src/; arduino-cli --export-binaries writes build/.
