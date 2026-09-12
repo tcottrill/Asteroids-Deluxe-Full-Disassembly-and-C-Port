@@ -30,10 +30,10 @@ CORE   = os.path.join(SRC, "core")
 CORE_C = [
     "app_win.c", "dvg.c", "mainline.c", "vgutil.c", "message.c", "mathrom.c",
     "frame.c", "objects.c", "draw.c", "player.c", "enemy.c", "score.c",
-    "sound.c", "nmi.c", "earom.c", "stest.c", "pokey.c", "er2055.c",
+    "sound.c", "nmi.c", "earom.c", "stest.c", "c012294.c", "er2055.c",
     "astdelux_rom.c",
 ]
-CORE_H = ["astdelux.h", "astdelux_state.h", "astdelux_rom.h", "pokey.h", "er2055.h"]
+CORE_H = ["astdelux.h", "astdelux_state.h", "astdelux_rom.h", "c012294.h", "er2055.h"]
 PLATFORM_H = os.path.join("platform", "ad_platform.h")
 
 # ad_platform.h's AD_SMP_* order: explode1..4 then thrust

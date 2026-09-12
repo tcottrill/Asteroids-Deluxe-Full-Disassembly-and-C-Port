@@ -191,7 +191,7 @@ uint8_t ad_hw_rom_rev(void);
  * this is stated only where the ROM itself states the assumption - the
  * self-test's POTGO at $7ED0 and PKYTST's "S/B 0" read at $7FDD, with
  * four digit draws between them.  The same pattern Tempest's protection
- * needs (pokey.h's time-model note). */
+ * needs (c012294.h's time-model note). */
 void    ad_hw_cycles(uint16_t cycles);
 
 uint8_t ad_hw_pokey_read(uint8_t reg);      /* $2C00..$2C0F */

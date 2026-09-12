@@ -80,7 +80,7 @@
 #define AUDIO_RING_START   1024 /* output stays silent until the ring first holds this */
 #define AUDIO_RING_LOW     512  /* below: duplicate one frame per pull (consumer slows) */
 #define AUDIO_RING_HIGH    3072 /* above: skip one frame per pull */
-#define AUDIO_POKEY_GAIN   256  /* x/256 on the POKEY render (pokey.c already
+#define AUDIO_POKEY_GAIN   256  /* x/256 on the POKEY output (c012294.c already
                                  * scales a full channel to 32767/11 * 15) TUNE */
 #define AUDIO_SAMPLE_GAIN  128  /* (u8 - 128) * this: +-16384 full scale  TUNE */
 #define AUDIO_CHANNELS     2    /* app_win.c's AD_CHAN_THRUST 0, AD_CHAN_EXPLOSION 1 */

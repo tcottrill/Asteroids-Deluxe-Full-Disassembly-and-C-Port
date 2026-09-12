@@ -37,6 +37,6 @@ rem Every module is translated, so the build is always the full game; the
 rem names given only pick the probe and the output.
 cl /nologo /W4 /std:c11 /O2 /I.. /Fo:obj_%FIRST%\ /Fe:test_%FIRST%.exe %DEFS% ^
    ..\mainline.c ..\vgutil.c ..\message.c ..\mathrom.c ..\frame.c ..\objects.c ..\draw.c ^
-   ..\player.c ..\enemy.c ..\score.c ..\sound.c ..\nmi.c ..\earom.c ..\stest.c ..\pokey.c ..\er2055.c ^
+   ..\player.c ..\enemy.c ..\score.c ..\sound.c ..\nmi.c ..\earom.c ..\stest.c ..\c012294.c ..\er2055.c ^
    stubs.c host_stub.c ..\astdelux_rom.c %SRCS%
 endlocal

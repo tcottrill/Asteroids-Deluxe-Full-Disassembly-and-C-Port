@@ -2,7 +2,7 @@
  *
  * Everything the ROM reached through hardware comes through here.  This
  * one supplies quiet hardware, a few scripted switches, a real POKEY
- * (pokey.c) standing behind RANDOM/ALLPOT, and quiet sound output: the
+ * (c012294.c) standing behind RANDOM/ALLPOT, and quiet sound output: the
  * renderer exists (ad_pokey_render()) but nothing here calls it,
  * because this host has no audio device.  A real host also swaps in
  * input and a renderer that interprets g.vram as a display list
@@ -32,7 +32,7 @@
 #include <string.h>
 
 #include "astdelux.h"
-#include "pokey.h"
+#include "c012294.h"
 #include "er2055.h"
 
 /* POKEY clock is the same 1.512 MHz as the 6502 (astdelux2_main.asm);
@@ -42,7 +42,7 @@ static ad_pokey pokey;
 #define AD_RANDOM_READ_COST 64     /* POKEY cycles charged before each game RANDOM
                                     * read: a stand-in for the 6502 cycles the read
                                     * and its neighbours take, since there is no CPU
-                                    * to count them (the chip charges nothing - pokey.h) */
+                                    * to count them (the chip charges nothing - c012294.h) */
 #define AD_MAINLINE_LEAD_CYCLES 512 /* advanced before each main-line frame: on the
                                     * board the frame runs for milliseconds after the
                                     * NMI, so PKYTST's ALLPOT read finds the NMI's
@@ -117,16 +117,16 @@ uint8_t ad_hw_switch(uint16_t addr)
 }
 
 /* POKEY.  Register 8 (read) is ALLPOT: the coin DIP (OPTN5) is strapped
- * to the pot pins, so pokey.c's pot-scan model answers it; $01 is one
+ * to the pot pins, so c012294.c's pot-scan model answers it; $01 is one
  * coin per credit with the multiplier and bonus-adder bits off, and
  * leaves bits 1-7 clear so PKYTST picks the normal rock speeds (see
  * ad_pokey_set_allpot() in main() below). */
 uint8_t ad_hw_pokey_read(uint8_t r)   { return ad_pokey_read(&pokey, r); }
 void    ad_hw_pokey_write(uint8_t r, uint8_t v) { ad_pokey_write(&pokey, r, v); }
 
-/* RANDOM, from the real POKEY polynomial (pokey.c).  The game's reads
+/* RANDOM, from the real POKEY polynomial (c012294.c).  The game's reads
  * are not cycle-annotated, so this host moves the chip a flat
- * AD_RANDOM_READ_COST before each one - see pokey.h's time model.
+ * AD_RANDOM_READ_COST before each one - see c012294.h's time model.
  * Probes still want a dead-quiet RANDOM for reproducible expectations,
  * hence the override below. */
 bool ad_host_random_off;                    /* probes set this for RANDOM = 0 */

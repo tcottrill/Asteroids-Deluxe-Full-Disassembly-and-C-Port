@@ -21,7 +21,7 @@ cl /nologo /W3 /MD /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /c ^
 cl /nologo /W4 /std:c11 /MD /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /Foobj\ ^
    app_win.c dvg.c platform\windows\plat_win.c ^
    mainline.c vgutil.c message.c mathrom.c frame.c objects.c draw.c ^
-   player.c enemy.c score.c sound.c nmi.c earom.c stest.c pokey.c er2055.c astdelux_rom.c ^
+   player.c enemy.c score.c sound.c nmi.c earom.c stest.c c012294.c er2055.c astdelux_rom.c ^
    obj\sys_gl.obj obj\glew.obj obj\log.obj ^
    obj\vector_draw.obj obj\mat4.obj obj\rawinput.obj ^
    obj\mixer.obj obj\fileio.obj obj\miniz.obj ^

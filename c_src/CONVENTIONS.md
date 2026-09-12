@@ -134,8 +134,8 @@ path, and never gate on anything but `ad_hw_rom_rev()`.
 | `nmi.c` | `NMI` and the `DCIN65.MAC` coin machinery |
 | `earom.c` | `EAUPD`, `STEAROM` |
 | `stest.c` | the cabinet self-test — `STEST3`'s ROM checksum and bank-select test, `STEST5`/`STEST6`/`STEST7`, `SWCH`, `BONDSP` |
-| `pokey.c` | the POKEY (Atari C012294) sound and RNG core, translated from the AAE emulator's core (`aae_pokey.cpp`), with the poly generators and reset model from MAME's `pokey.cpp`; not a ROM routine — the chip is hardware the ROM talks to — so it carries no `ad_` prefix and no platform includes |
-| `er2055.c` | the ER2055 EAROM (GI, 64x8) behind `EACTL`/`EADAL`/`EAIN`, translated from MAME 0.286's `er2055.cpp` as `asteroid.cpp` wires it; same footing as `pokey.c` — hardware the ROM talks to, no `ad_` prefix, no platform includes |
+| `c012294.c` | the POKEY (Atari C012294) sound and RNG core: a cycle-stepped model developed in the Atari 800 project and shared byte-identical with the AAE emulator and the Space Duel port (poly generators and reset model from MAME's `pokey.cpp`, timing and pot scanner from the Altirra Hardware Reference, the RANDOM chain from a gate-level transcription of Atari's schematics); not a ROM routine — the chip is hardware the ROM talks to — with an `ad_` API prefix kept for its hosts and no platform includes. Keep the copies identical; `tests\build_pokey.bat` and `build_mod.bat pokey` are its gates here |
+| `er2055.c` | the ER2055 EAROM (GI, 64x8) behind `EACTL`/`EADAL`/`EAIN`, translated from MAME 0.286's `er2055.cpp` as `asteroid.cpp` wires it; same footing as `c012294.c` — hardware the ROM talks to, no platform includes |
 | `astdelux_rom.c` | **generated** — the ROM images, read through `ad_rom()` |
 | `tests/stubs.c` | empty — every routine is translated; kept as the staging hook for `tests/build_mod.bat` |
 

@@ -8,9 +8,12 @@ persistent high scores.** The main line, the object engine, the
 enemies, scoring and the high-score table, the sound sequencer, the NMI
 and coin logic, the EAROM, the display-list builders and the cabinet
 self-test are all in, one C function per named routine, with the ROM
-address on each. A real POKEY (`pokey.c`) stands behind RANDOM, the
-coin option switches and the game's audio, and its output is streamed
-to the window's audio device every NMI tick. The two discrete circuits,
+address on each. A real POKEY (`c012294.c`, a cycle-stepped model of the
+chip shared byte for byte with the Space Duel port, the AAE emulator and
+the Atari 800 project it is developed in) stands behind RANDOM, the coin
+option switches and the game's audio; it generates that audio from its
+own counters as machine time advances, and each NMI tick's worth is
+drained to the window's audio device. The two discrete circuits,
 explosion and thrust, play as samples recorded from a real cabinet.
 Behind `EACTL`/`EADAL`/`EAIN` sits a real ER2055 model (`er2055.c`,
 translated from MAME's `er2055.cpp`); the window host persists it in
@@ -88,7 +91,7 @@ test_objects.exe --probe
 | `mainline.c` | `START` and the frame loop |
 | `vgutil.c` | the `DSTCUT.MAC` display-list builders |
 | `frame.c`, `objects.c`, `draw.c`, `player.c`, `enemy.c`, `score.c`, `sound.c`, `nmi.c`, `earom.c`, `message.c`, `mathrom.c`, `stest.c` | the game, one file per subsystem; `CONVENTIONS.md` has the map |
-| `pokey.c/.h` | the POKEY sound and RNG chip — hardware the ROM talks to, not a ROM routine; shared unchanged with the Space Duel port |
+| `c012294.c/.h` | the POKEY sound and RNG chip — hardware the ROM talks to, not a ROM routine; a cycle-stepped model (timers, IRQs, serial port, pot scanner, keyboard, RANDOM, audio from the same counters) shared byte-identical with the Space Duel port, AAE and the Atari 800 project; `tests/build_pokey.bat` is its regression gate here |
 | `er2055.c/.h` | the ER2055 EAROM behind `EACTL`/`EADAL`/`EAIN`, translated from MAME's `er2055.cpp` |
 | `app_win.c` | the Windows host's game loop: NMI pacing, POKEY cycle feed, audio push, input, EAROM persistence |
 | `platform/` | `ad_platform.h`, the host interface; `windows/` — the OpenGL beam renderer, XAudio2 mixer, raw input, joystick, ini and logging; `teensy/` — the standalone Teensy 4.1 backend for the Teensy Vector Emulation PCB (DAC7811 X/Y, Z ladder, PT8211 audio), see its README |

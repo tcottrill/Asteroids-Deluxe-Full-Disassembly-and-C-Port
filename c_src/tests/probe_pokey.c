@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "pokey.h"
+#include "c012294.h"
 
 /* Where the tables' 17-bit sequence is when the chip's chain has
  * settled under SKCTL reset: entries 0..8 of rand17 are all 0xFF and
@@ -164,6 +164,19 @@ static void check_random_17(void)
     ad_pokey chip;
     ad_pokey_init(&chip, 1512000, 44100);
     ad_pokey_write(&chip, W_SKCTL, 7);        /* rng on, fast pot; AUDCTL still 0 */
+    /* c012294.c's rng_init_prev: SKCTL's register and the RANDOM chain move
+     * on the same clock edge, so the edge the write lands on still sees the
+     * pre-write (held) Init - the release only takes effect from the
+     * following clock.  Altirra HRM ch.5, "Initialization behaviour": "When
+     * exiting initialization mode, the polynomial counters begin counting
+     * immediately" - i.e. immediately after that first clock, not the write
+     * itself.  Spend that one clock here: the chain is still at its settled
+     * fixed point (RESET_POS17), so this is a genuine no-op, and it leaves
+     * the 64-cycle spacing below landing on the same table positions
+     * expect17[] was computed for (rand17[8 + (k+1)*64]) instead of one
+     * short of them.  Verified against the unmodified chip: without this,
+     * every read here comes back shifted to rand17[8 + (k+1)*64 - 1]. */
+    ad_pokey_advance(&chip, 1);
     for (int k = 0; k < 16; k++) {
         ad_pokey_advance(&chip, 64);
         uint8_t v = ad_pokey_read(&chip, R_RANDOM);
@@ -181,6 +194,12 @@ static void check_random_9(void)
                                                    * chain absorbs that, and a ROM's two
                                                    * stores are at least four cycles apart */
     ad_pokey_write(&chip, W_SKCTL, 7);
+    /* Same one-clock Init lag as check_random_17 (c012294.c's
+     * rng_init_prev - see that check's comment and the Altirra HRM
+     * citation there): absorb it here, at the fixed point, so the loop's
+     * 64-cycle spacing lands on the same positions expect9[] was
+     * computed for. */
+    ad_pokey_advance(&chip, 1);
     for (int k = 0; k < 16; k++) {
         ad_pokey_advance(&chip, 64);
         uint8_t v = ad_pokey_read(&chip, R_RANDOM);
@@ -243,6 +262,11 @@ static void check_random_skctl(void)
     const uint8_t *rand17 = ad_pokey_dbg_rand17();
     ad_pokey_init(&chip, 1512000, 44100);
     ad_pokey_write(&chip, W_SKCTL, 7);
+    /* c012294.c's rng_init_prev one-clock Init lag - see check_random_17's
+     * comment and the Altirra HRM citation there. Absorbed here (a no-op
+     * at the settled fixed point) so the 64-cycle spacing below lands on
+     * expect17[0]'s table position, same as check (2). */
+    ad_pokey_advance(&chip, 1);
     ad_pokey_advance(&chip, 64);
     uint8_t first = ad_pokey_read(&chip, R_RANDOM);
     CHECK(first == expect17[0], "sanity: first RANDOM byte should match check (2), got %02X", first);
@@ -288,20 +312,36 @@ static void check_random_skctl(void)
     ad_pokey_write(&chip, W_SKCTL, 7);         /* release: position 8 from here */
     uint8_t v = ad_pokey_read(&chip, R_RANDOM);
     CHECK(v == rand17[8], "at release RANDOM should read entry 8, got %02X", v);
+    /* This first advance() after the release write is exactly where the
+     * one-clock Init lag lands (c012294.c's rng_init_prev): of these 4
+     * requested cycles, the first is spent on the pre-write (still held)
+     * Init - a no-op at the fixed point - and only the remaining 3 are
+     * real released shifts.  So the position actually reached is entry 8
+     * + 3 = 11, not 8 + 4 = 12.  This is not a fudge: entry 11 is 0x1F,
+     * exactly the Altirra HRM's own cross-check value ("STA SKCTL + LDA
+     * RANDOM back-to-back will give A=$1F, which is four bits after the
+     * all ones state" - ch.5, "Initialization behaviour"), confirmed
+     * against the unmodified chip. */
     ad_pokey_advance(&chip, 4);
     v = ad_pokey_read(&chip, R_RANDOM);
-    CHECK(v == rand17[12], "4 cycles after release RANDOM should read entry 12 (not 1012): got %02X, expected %02X",
-          v, rand17[12]);
+    CHECK(v == rand17[11], "4 cycles after release RANDOM should read entry 11 (not 1011): got %02X, expected %02X",
+          v, rand17[11]);
 
     ad_pokey_write(&chip, W_SKCTL, 7);         /* same value: no-op */
     v = ad_pokey_read(&chip, R_RANDOM);
-    CHECK(v == rand17[12], "rewriting SKCTL with the same value should not restart: got %02X", v);
+    CHECK(v == rand17[11], "rewriting SKCTL with the same value should not restart: got %02X", v);
 
     ad_pokey_write(&chip, W_SKCTL, 3);         /* init bits still set: no restart */
     v = ad_pokey_read(&chip, R_RANDOM);
-    CHECK(v == rand17[12], "SKCTL 7->3 keeps the init bits set and should not restart: got %02X", v);
+    CHECK(v == rand17[11], "SKCTL 7->3 keeps the init bits set and should not restart: got %02X", v);
 
-    ad_pokey_advance(&chip, 60);               /* position 8+64 again */
+    /* No further SKCTL transition happens between here and the read below,
+     * so this advance() runs entirely as real released shifts (no lag to
+     * absorb).  61 more from entry 11 lands on entry 8+64=72, the same
+     * table position expect17[0] was computed for - one more than the
+     * "position 8+64 again" the pre-lag probe used, because entry 11 (not
+     * 12) is where the chain actually sits at this point. */
+    ad_pokey_advance(&chip, 61);
     v = ad_pokey_read(&chip, R_RANDOM);
     CHECK(v == expect17[0], "64 cycles after release RANDOM should match check (2)'s first byte: got %02X", v);
 }
@@ -668,6 +708,15 @@ static const ad_pokey_host test_host = {
     NULL, th_raise_irq, th_pot_read, th_keyboard_scan, th_serial_in, th_serial_out
 };
 
+/* Timer pipeline checks need the same one-clock cadence as the Atari host.
+ * A coarse advance that spans a borrow intentionally reports only aggregate
+ * timer activity, so it cannot preserve the sub-slice position of a newly
+ * staged IRQ. */
+static void advance_one_by_one(ad_pokey *p, uint32_t n)
+{
+    while (n--) ad_pokey_advance(p, 1);
+}
+
 static void check_host_seam(void)
 {
     ad_pokey chip;
@@ -677,120 +726,175 @@ static void check_host_seam(void)
     th.serial_byte_queued = -1;
     ad_pokey_set_host(&chip, &test_host);
 
-    /* --- timer 0 (TIMR1, channel 0): SKCTL=7, AUDCTL=0, AUDF1=0 ->
-     * period = (0 + 1) * DIV_64 = 28 cycles. --- */
+    /* --- hardware timer IRQ timing ---
+     * Keep these checks on a separate chip and advance cycle-by-cycle around
+     * every expected event.  The timer borrow is NOT the IRQST event.
+     * Altirra HRM 5.3's detailed timer timing, cross-checked by acid800
+     * pokey_timertiming (AUDF1=16 -> IRQST boundary 23c/24c), puts the
+     * observable timer IRQ four clocks after the borrow in this model.  The
+     * old probe asserted on the borrow itself and also used large advance()
+     * slices that could collapse several borrows into one staged event, which
+     * let a stale staged IRQ leak into the keyboard/serial checks below. */
+    {
+        ad_pokey t;
+        ad_pokey_init(&t, 1512000, 44100);
+        ad_pokey_set_host(&t, &test_host);
+
+        memset(&th, 0, sizeof th);
+        th.kbd_code_queued = -1;
+        th.serial_byte_queued = -1;
+
+        /* TIMR1 / channel 1, slow 64KHz clock.  After a settled init
+         * release, the shared clock's first timer pulse is 20 cycles after
+         * SKCTL and IRQST is visible at +24; subsequent pulses are 28 cycles
+         * apart.  Altirra HRM 5.2 gives the observable +24 anchor directly. */
+        ad_pokey_write(&t, W_SKCTL, 7);
+        ad_pokey_write(&t, W_AUDCTL, 0x00);
+        ad_pokey_write(&t, W_AUDF1, 0x00);
+        ad_pokey_write(&t, W_IRQEN, IRQ_TIMR1);
+
+        /* The first post-init source pulse is on cycle 21, so IRQST is first
+         * READABLE on cycle 25.  HRM 5.2 says "the IRQ is asserted in IRQST 83
+         * and 24 cycles after the write to SKCTL that clears init mode", and
+         * this block used to place the pulse at 20 and the read at 24 from
+         * that sentence.  acid800's pokey_inittiming disagrees, and it is the
+         * arbiter: its third group brackets the assertion with reads one cycle
+         * apart, four times over - twice on the 15KHz clock and twice on the
+         * 64KHz clock - and all four only pass with the pulse one cycle later,
+         * i.e. with the manual's 83/24 naming the cycle the latch CHANGES and
+         * the value first being readable on the next one.  Timing-model
+         * correction; no expect17[]/expect9[] constant is touched. */
+        advance_one_by_one(&t, 20);
+        CHECK(th.irq_calls == 0, "timer1: no IRQ before the first post-init 64KHz pulse, got %d call(s)", th.irq_calls);
+        uint8_t irqst = ad_pokey_read(&t, R_IRQST);
+        CHECK(irqst == (uint8_t)~IRQ_SEROC,
+              "timer1: R_IRQST should read 0xF7 before the first borrow, got %02X", irqst);
+
+        advance_one_by_one(&t, 1);                 /* cycle 21: first source pulse / borrow */
+        CHECK(th.irq_calls == 0 && (ad_pokey_read(&t, R_IRQST) & IRQ_TIMR1),
+              "timer1: first borrow at cycle 21 must not assert IRQST yet");
+        advance_one_by_one(&t, 3);                 /* cycles 22-24: pipeline */
+        CHECK(th.irq_calls == 0 && (ad_pokey_read(&t, R_IRQST) & IRQ_TIMR1),
+              "timer1: IRQST must remain clear through cycle 24");
+        advance_one_by_one(&t, 1);                 /* cycle 25: IRQST visible */
+        CHECK(th.irq_calls == 1 && th.irq_mask == IRQ_TIMR1,
+              "timer1: reset-phase IRQ should assert at cycle 25 (21+4), got %d call(s), mask %02X",
+              th.irq_calls, th.irq_mask);
+        irqst = ad_pokey_read(&t, R_IRQST);
+        CHECK(irqst == (uint8_t)~(IRQ_TIMR1 | IRQ_SEROC),
+              "timer1: R_IRQST should read 0xF6 when the staged IRQ arrives, got %02X", irqst);
+
+        /* IRQEN gates the latch but never resets the timer phase.  At cycle
+         * 24 the next borrow is 24 cycles away (steady 28-cycle source phase).
+         * Run 10 clocks disabled,
+         * re-enable with 14 clocks left, then expect IRQST four clocks after
+         * that phase-preserved borrow: 18 clocks after the re-enable write. */
+        ad_pokey_write(&t, W_IRQEN, 0);
+        irqst = ad_pokey_read(&t, R_IRQST);
+        CHECK(irqst == (uint8_t)~IRQ_SEROC,
+              "timer1: IRQEN=0 should clear the latched IRQST bit, got %02X", irqst);
+        int calls_before_gate = th.irq_calls;
+        advance_one_by_one(&t, 10);
+        CHECK(th.irq_calls == calls_before_gate,
+              "timer1: no raise_irq() while disabled, got %d new call(s)", th.irq_calls - calls_before_gate);
+
+        ad_pokey_write(&t, W_IRQEN, IRQ_TIMR1);
+        int calls_before_phase = th.irq_calls;
+        advance_one_by_one(&t, 17);
+        CHECK(th.irq_calls == calls_before_phase,
+              "timer1: phase-preserved IRQ should not arrive before 18 cycles after re-enable, got %d new call(s)",
+              th.irq_calls - calls_before_phase);
+        advance_one_by_one(&t, 1);
+        CHECK(th.irq_calls == calls_before_phase + 1,
+              "timer1: phase-preserved borrow+pipeline should assert on the 18th cycle, got %d new call(s)",
+              th.irq_calls - calls_before_phase);
+
+        /* TIMR2 / joined fast channels: AUDF1=$10, AUDF2=$00 -> divisor 23,
+         * then the same four-cycle borrow-to-IRQST pipeline.  Start fresh so
+         * no staged timer1 event can contaminate this timing. */
+        ad_pokey_reset(&t);
+        memset(&th, 0, sizeof th);
+        th.kbd_code_queued = -1;
+        th.serial_byte_queued = -1;
+        ad_pokey_write(&t, W_SKCTL, 7);
+        ad_pokey_write(&t, W_AUDF1, 0x10);
+        ad_pokey_write(&t, W_AUDF2, 0x00);
+        ad_pokey_write(&t, W_IRQEN, IRQ_TIMR2);
+        ad_pokey_write(&t, W_AUDCTL, CTL_CH12_JOIN | CTL_CH1_HICLK);
+        CHECK(t.divisor[1] == 23, "timer2 setup: channel 2's divisor should be 23, got %u",
+              (unsigned)t.divisor[1]);
+
+        advance_one_by_one(&t, 22);
+        CHECK(th.irq_calls == 0, "timer2: no IRQ after 22 of 23 cycles, got %d call(s)", th.irq_calls);
+        advance_one_by_one(&t, 1);                 /* cycle 23: borrow */
+        CHECK(th.irq_calls == 0 && (ad_pokey_read(&t, R_IRQST) & IRQ_TIMR2),
+              "timer2: borrow at cycle 23 must not assert IRQST yet");
+        advance_one_by_one(&t, 3);
+        CHECK(th.irq_calls == 0, "timer2: IRQST must remain clear for the next three pipeline cycles");
+        advance_one_by_one(&t, 1);                 /* cycle 27: IRQST */
+        CHECK(th.irq_calls == 1 && th.irq_mask == IRQ_TIMR2,
+              "timer2: raise_irq(0x02) should fire at cycle 27 (23+4), got %d call(s), mask %02X",
+              th.irq_calls, th.irq_mask);
+
+        /* STIMER discards the current countdown phase, but it does not remove
+         * the four-cycle IRQ pipeline from the next underflow. */
+        advance_one_by_one(&t, 10);
+        ad_pokey_write(&t, W_IRQEN, 0);          /* acknowledge old TIMR2 latch */
+        ad_pokey_write(&t, W_IRQEN, IRQ_TIMR2);  /* plenty of setup before next source */
+        ad_pokey_write(&t, W_STIMER, 0);
+        th.irq_calls = 0; th.irq_mask = 0;
+        advance_one_by_one(&t, 22);
+        CHECK(th.irq_calls == 0,
+              "STIMER: no IRQ before the fresh 23-cycle borrow, got %d call(s)", th.irq_calls);
+        advance_one_by_one(&t, 1);                 /* borrow */
+        CHECK(th.irq_calls == 0, "STIMER: borrow itself must not assert IRQST");
+        advance_one_by_one(&t, 3);
+        CHECK(th.irq_calls == 0, "STIMER: staged IRQ must still be pending three cycles after borrow");
+        advance_one_by_one(&t, 1);
+        CHECK(th.irq_calls == 1 && th.irq_mask == IRQ_TIMR2,
+              "STIMER: fresh timer2 IRQ should assert 27 cycles after STIMER (23+4), got %d call(s), mask %02X",
+              th.irq_calls, th.irq_mask);
+
+        /* Init holds 15/64KHz clocks but not the 1.79MHz source. */
+        ad_pokey_reset(&t);
+        memset(&th, 0, sizeof th);
+        th.kbd_code_queued = -1;
+        th.serial_byte_queued = -1;
+        ad_pokey_write(&t, W_SKCTL, 7);
+        ad_pokey_write(&t, W_AUDF1, 0x10);
+        ad_pokey_write(&t, W_AUDF2, 0x00);
+        ad_pokey_write(&t, W_IRQEN, IRQ_TIMR2);
+        ad_pokey_write(&t, W_AUDCTL, CTL_CH12_JOIN | CTL_CH1_HICLK);
+        ad_pokey_write(&t, W_SKCTL, 0);
+        advance_one_by_one(&t, 27);
+        CHECK(th.irq_calls == 1,
+              "held reset: a timer derived from the 1.79MHz clock should still reach IRQST, got %d call(s)", th.irq_calls);
+
+        ad_pokey_write(&t, W_IRQEN, 0);
+        ad_pokey_write(&t, W_AUDCTL, 0x00);      /* channel 2 -> 64KHz, rearmed */
+        ad_pokey_write(&t, W_IRQEN, IRQ_TIMR2);
+        th.irq_calls = 0; th.irq_mask = 0;
+        const uint32_t held_count = t.tcnt[1];
+        advance_one_by_one(&t, 100);
+        CHECK(th.irq_calls == 0 && t.tcnt[1] == held_count,
+              "held reset: a 64KHz timer must stand still (count %u -> %u, IRQ calls %d)",
+              (unsigned)held_count, (unsigned)t.tcnt[1], th.irq_calls);
+
+        ad_pokey_write(&t, W_SKCTL, 7);
+        advance_one_by_one(&t, 24);                /* see the cycle-25 note above */
+        CHECK(th.irq_calls == 0,
+              "release: reset-phase 64KHz timer should not reach IRQST before cycle 25, got %d call(s)", th.irq_calls);
+        advance_one_by_one(&t, 1);
+        CHECK(th.irq_calls == 1,
+              "release: reset-phase 64KHz timer should reach IRQST on cycle 25, got %d call(s)", th.irq_calls);
+    }
+
+    /* Timer tests use a private chip so staged timer IRQs cannot bleed into
+     * the shared host-seam checks below. */
+    memset(&th, 0, sizeof th);
+    th.kbd_code_queued = -1;
+    th.serial_byte_queued = -1;
     ad_pokey_write(&chip, W_SKCTL, 7);
-    ad_pokey_write(&chip, W_AUDCTL, 0x00);
-    ad_pokey_write(&chip, W_AUDF1, 0x00);
-    ad_pokey_write(&chip, W_IRQEN, IRQ_TIMR1);
-
-    ad_pokey_advance(&chip, 27);
-    CHECK(th.irq_calls == 0, "timer1: no IRQ after 27 of 28 cycles, got %d call(s)", th.irq_calls);
-    /* IRQST bit 3 is the transmitter's idle level, low on a quiet chip,
-     * so an idle chip reads 0xF7 - the timer reads below look past it. */
-    uint8_t irqst = ad_pokey_read(&chip, R_IRQST);
-    CHECK(irqst == (uint8_t)~IRQ_SEROC, "timer1: R_IRQST should read 0xF7 before the first borrow, got %02X", irqst);
-
-    ad_pokey_advance(&chip, 1);            /* the 28th cycle: the borrow fires */
-    CHECK(th.irq_calls == 1 && th.irq_mask == IRQ_TIMR1,
-          "timer1: raise_irq(0x01) should fire at cycle 28, got %d call(s), mask %02X",
-          th.irq_calls, th.irq_mask);
-    irqst = ad_pokey_read(&chip, R_IRQST);
-    CHECK(irqst == (uint8_t)~(IRQ_TIMR1 | IRQ_SEROC),
-          "timer1: R_IRQST should read 0xF6 (bit 0 low) after the borrow, got %02X", irqst);
-
-    ad_pokey_advance(&chip, 28 * 5);       /* five more periods in one slice: IRQST is a latch */
-    CHECK(th.irq_calls == 2, "timer1: a slice spanning several periods should still call raise_irq() once, got %d total",
-          th.irq_calls);
-    CHECK(th.irq_mask == IRQ_TIMR1, "timer1: IRQST should still just be 0x01, got %02X", th.irq_mask);
-
-    ad_pokey_write(&chip, W_IRQEN, 0);     /* disabling clears the pending IRQST bit */
-    irqst = ad_pokey_read(&chip, R_IRQST);
-    CHECK(irqst == (uint8_t)~IRQ_SEROC, "timer1: IRQEN=0 should clear IRQST, R_IRQST should read 0xF7, got %02X", irqst);
-
-    int calls_before_gate = th.irq_calls;
-    ad_pokey_advance(&chip, 200);          /* the timer keeps counting; IRQEN=0 only gates the callback */
-    CHECK(th.irq_calls == calls_before_gate,
-          "timer1: no raise_irq() while IRQEN=0, got %d new call(s)", th.irq_calls - calls_before_gate);
-
-    /* Re-enable: the countdown was never reset by the IRQEN writes, so
-     * the next borrow lands wherever the 28-cycle phase says it should,
-     * not 28 cycles after this write.  168 cycles (28 + 140) have run
-     * since the last rearm (the AUDF1 write) with the IRQ gated off for
-     * the last 200 of those; 200 % 28 == 4, so the countdown has 24
-     * cycles left, not a fresh 28. */
-    ad_pokey_write(&chip, W_IRQEN, IRQ_TIMR1);
-    int calls_before_phase = th.irq_calls;
-    ad_pokey_advance(&chip, 23);
-    CHECK(th.irq_calls == calls_before_phase,
-          "timer1: phase kept through the gated slice - 23 more cycles should not reach it yet, got %d new call(s)",
-          th.irq_calls - calls_before_phase);
-    ad_pokey_advance(&chip, 1);
-    CHECK(th.irq_calls == calls_before_phase + 1,
-          "timer1: the 24th cycle should reach the phase-preserved borrow, got %d new call(s)",
-          th.irq_calls - calls_before_phase);
-
-    /* --- timer 1 (TIMR2, channel 1): CH12_JOIN + CH1_HICLK, AUDF1=0x10,
-     * AUDF2=0x00 -> period = AUDF2*256 + AUDF1 + 7 = 0x10 + 7 = 23
-     * cycles; the AUDCTL write itself re-arms it. --- */
-    ad_pokey_write(&chip, W_AUDF1, 0x10);
-    ad_pokey_write(&chip, W_AUDF2, 0x00);
-    ad_pokey_write(&chip, W_IRQEN, IRQ_TIMR2);
-    ad_pokey_write(&chip, W_AUDCTL, CTL_CH12_JOIN | CTL_CH1_HICLK);
-    CHECK(chip.divisor[1] == 23, "timer2 setup: channel 1's divisor should be 23, got %u",
-          (unsigned)chip.divisor[1]);
-
-    int calls_before_t2 = th.irq_calls;
-    th.irq_mask = 0;   /* was left holding IRQ_TIMR1 from the section above */
-    ad_pokey_advance(&chip, 22);
-    CHECK(th.irq_calls == calls_before_t2, "timer2: no IRQ after 22 of 23 cycles, got %d new call(s)",
-          th.irq_calls - calls_before_t2);
-    ad_pokey_advance(&chip, 1);
-    CHECK(th.irq_calls == calls_before_t2 + 1 && th.irq_mask == IRQ_TIMR2,
-          "timer2: raise_irq(0x02) should fire at cycle 23, got %d new call(s), mask %02X",
-          th.irq_calls - calls_before_t2, th.irq_mask);
-
-    /* STIMER re-arms every timer to a full period from now, discarding
-     * whatever phase it was mid-way through. */
-    ad_pokey_advance(&chip, 10);           /* 10 cycles into the next 23-cycle period */
-    ad_pokey_write(&chip, W_STIMER, 0);
-    int calls_before_st = th.irq_calls;
-    ad_pokey_advance(&chip, 22);
-    CHECK(th.irq_calls == calls_before_st,
-          "STIMER: no IRQ 22 cycles after STIMER (would have fired already without the rearm), got %d new call(s)",
-          th.irq_calls - calls_before_st);
-    ad_pokey_advance(&chip, 1);
-    CHECK(th.irq_calls == calls_before_st + 1,
-          "STIMER: a full 23-cycle period after STIMER should reach the borrow, got %d new call(s)",
-          th.irq_calls - calls_before_st);
-
-    /* While SKCTL holds the chip in reset only the 15/64 kHz clocks
-     * stop.  Channel 2 here is joined to a fast-clock channel 1, so its
-     * timer keeps counting through the hold; switch AUDCTL to the slow
-     * clock (which re-arms every timer) and the same timer stands still
-     * for the rest of the hold, then resumes with its phase intact at
-     * release - see timer_runs() in pokey.c. */
-    ad_pokey_write(&chip, W_SKCTL, 0);
-    int calls_before_held = th.irq_calls;
-    ad_pokey_advance(&chip, 1000);
-    CHECK(th.irq_calls > calls_before_held,
-          "held reset: a timer on the fast clock keeps firing, got %d new call(s)",
-          th.irq_calls - calls_before_held);
-    ad_pokey_write(&chip, W_AUDCTL, 0x00);  /* channel 2 on the 64 kHz clock: AUDF2=0 -> 28 cycles */
-    calls_before_held = th.irq_calls;
-    ad_pokey_advance(&chip, 1000);
-    CHECK(th.irq_calls == calls_before_held,
-          "held reset: a timer on the slow clock stands still, got %d new call(s)",
-          th.irq_calls - calls_before_held);
-    ad_pokey_write(&chip, W_SKCTL, 7);     /* release: the full 28 cycles are still ahead */
-    ad_pokey_advance(&chip, 27);
-    CHECK(th.irq_calls == calls_before_held,
-          "release: the slow-clock timer resumes where it stood, no IRQ after 27 cycles, got %d new call(s)",
-          th.irq_calls - calls_before_held);
-    ad_pokey_advance(&chip, 1);
-    CHECK(th.irq_calls == calls_before_held + 1,
-          "release: the slow-clock timer's borrow lands on the 28th cycle, got %d new call(s)",
-          th.irq_calls - calls_before_held);
 
     /* --- keyboard and SKSTAT ---
      * SKSTAT reads every condition as a 0 and bit 0 as a 1, so an idle
@@ -840,21 +944,32 @@ static void check_host_seam(void)
      * SKCTL bit 5 alone: both directions clock from timer 4.  Channels
      * 3+4 joined on the fast clock with AUDF3=$28, AUDF4=0 give a 47-
      * cycle borrow (the Atari's 19200 baud setting at 1.79 MHz): a bit
-     * is 94 cycles, a frame 940.  The last AUDF write re-armed timer 4,
-     * so its first borrow is 47 cycles after the SEROUT below. */
+     * is 94 cycles, a frame 940. HRM 5.3: AUDF changes the next reload,
+     * so explicitly strobe STIMER to start the 47-cycle period here. */
     ad_pokey_write(&chip, W_AUDCTL, CTL_CH34_JOIN | CTL_CH3_HICLK);
     ad_pokey_write(&chip, W_AUDF3, 0x28);
     ad_pokey_write(&chip, W_AUDF4, 0x00);
     ad_pokey_write(&chip, W_SKCTL, 0x27);
+    ad_pokey_write(&chip, W_STIMER, 0);
     CHECK(chip.divisor[3] == 47, "serial setup: channel 4's divisor should be 47, got %u", (unsigned)chip.divisor[3]);
     th.irq_calls = 0; th.irq_mask = 0; th.serout_calls = 0;
     ad_pokey_write(&chip, W_IRQEN, IRQ_SEROR | IRQ_SEROC | IRQ_SERIN);
     CHECK(th.irq_mask == IRQ_SEROC, "serial: enabling bit 3 with the transmitter idle asserts it at once, got mask %02X", th.irq_mask);
     CHECK((ad_pokey_read(&chip, R_IRQST) & IRQ_SEROC) == 0, "serial: IRQST bit 3 should read 0 while idle");
 
+    /* Bit 3 follows the SHIFT REGISTER, not SEROUT: a byte merely queued does
+     * not clear it.  HRM 5.6's warning - "there is a delay from the first
+     * write to SEROUT until the serial output ready/complete IRQs update" -
+     * and HRM 5.7 - the complete IRQ "deasserts automatically once a new byte
+     * is loaded into the output shift register and there is a delay from when
+     * SEROUT is written to when this occurs."  acid800 pokey_serclock's last
+     * check measures it directly: with the external clock selected and nothing
+     * driving it the byte never loads, and IRQST must read $F7, not $FF.
+     * Behaviour correction, not an expectation edit - no expect17[]/expect9[]
+     * constant is touched.  See tests\test_serial_frame.c. */
     ad_pokey_write(&chip, W_SEROUT, 0xA5);
     th.irq_mask = 0;
-    CHECK((ad_pokey_read(&chip, R_IRQST) & IRQ_SEROC) != 0, "serial: IRQST bit 3 should read 1 once a byte is waiting");
+    CHECK((ad_pokey_read(&chip, R_IRQST) & IRQ_SEROC) == 0, "serial: IRQST bit 3 stays 0 until the byte reaches the shifter");
     ad_pokey_advance(&chip, 46);
     CHECK(th.irq_mask == 0, "serial: nothing happens before the next borrow, got mask %02X", th.irq_mask);
     ad_pokey_advance(&chip, 1);                    /* the borrow: the shifter takes the byte */
@@ -870,21 +985,23 @@ static void check_host_seam(void)
     CHECK(th.irq_mask == IRQ_SEROC, "serial: going idle should raise 'transmission finished' (0x08), got mask %02X", th.irq_mask);
     CHECK((ad_pokey_read(&chip, R_IRQST) & IRQ_SEROC) == 0, "serial: IRQST bit 3 back to 0 when idle");
 
-    /* Double buffering: a byte written during a frame loads right
-     * after it, so a stream has no gap; a byte written over a waiting
-     * byte replaces it. */
+    /* Double buffering: a byte written during a frame loads on the very edge
+     * that finishes the previous one, so a stream has no gap and bit 3 never
+     * goes idle between bytes ("This IRQ will stay inactive continuously
+     * while sending back-to-back bytes", HRM 5.6).  A byte written over a
+     * waiting byte replaces it. */
     ad_pokey_write(&chip, W_SEROUT, 0x11);
     ad_pokey_write(&chip, W_SEROUT, 0x3C);         /* replaces 0x11 before any borrow */
     ad_pokey_advance(&chip, 47);                   /* load 0x3C */
     ad_pokey_write(&chip, W_SEROUT, 0x5A);         /* waits in the data register */
     th.irq_mask = 0;
-    ad_pokey_advance(&chip, 20 * 47);              /* 0x3C out */
+    ad_pokey_advance(&chip, 20 * 47);              /* 0x3C out; 0x5A loads on the same edge */
     CHECK(th.serout_calls == 2 && th.serout_byte == 0x3C, "serial: 0x3C should be the second byte out, got %d call(s), %02X",
           th.serout_calls, th.serout_byte);
+    CHECK((th.irq_mask & IRQ_SEROR) != 0, "serial: the waiting byte loads on the finishing edge, raising 'output data needed'");
     CHECK((th.irq_mask & IRQ_SEROC) == 0 && (ad_pokey_read(&chip, R_IRQST) & IRQ_SEROC) != 0,
-          "serial: with 0x5A waiting the transmitter is not finished");
-    ad_pokey_advance(&chip, 47);                   /* load 0x5A */
-    CHECK((th.irq_mask & IRQ_SEROR) != 0, "serial: loading the waiting byte raises 'output data needed' again");
+          "serial: back-to-back bytes never leave the shifter idle");
+    th.irq_mask = 0;
     ad_pokey_advance(&chip, 20 * 47);
     CHECK(th.serout_calls == 3 && th.serout_byte == 0x5A, "serial: 0x5A should follow with no gap, got %d call(s), %02X",
           th.serout_calls, th.serout_byte);
@@ -926,9 +1043,14 @@ static void check_host_seam(void)
     ad_pokey_write(&chip, W_SKREST, 0);
     CHECK((ad_pokey_read(&chip, R_SKSTAT) & ST_OVERRUN) != 0, "serial in: SKREST clears the overrun latch");
 
-    /* ad_pokey_serial_receive(): a start bit from the host directly;
-     * refused while a frame is in progress. */
+    /* ad_pokey_serial_receive(): a byte from the host directly; refused while
+     * a frame is already on the line.  The receiver is started by the START
+     * BIT, not by the hand-over, so the busy bit follows one clock later -
+     * HRM 5.6: SKSTAT bit 1 "switches to 0 when the start bit is sampled".
+     * (This block used to check the busy bit in the same breath as the call,
+     * which only held while the input was a byte interface.) */
     ad_pokey_serial_receive(&chip, 0x88);
+    ad_pokey_advance(&chip, 1);                    /* the start bit is sampled */
     CHECK((ad_pokey_read(&chip, R_SKSTAT) & ST_SERIN_BUSY) == 0, "serial in: serial_receive on an idle receiver starts a frame");
     ad_pokey_serial_receive(&chip, 0x99);          /* dropped: busy */
     ad_pokey_advance(&chip, 20 * 47);
@@ -968,10 +1090,9 @@ static void check_host_seam(void)
  * of Atari's POKEY schematics) in that file's own terms - the
  * lfsr9bit/lfsr17bit shift registers, swDelay, the three NORs of the
  * 9/17 switch and their delayed copies, Init - stepped one clock at a
- * time with no shortcuts.  pokey.c's chain takes the same registers but
- * jumps n clocks at once through GF(2) matrices whenever it is running
- * steadily; this check is what says the jumps, the settling under Init
- * and the select flip's transition clocks all land on the same bits as
+ * time with no shortcuts. The core packs those registers into bytes;
+ * this independently expressed reference checks that advancement, settling
+ * under Init and the select flip's transition clocks land on the same bits as
  * the plain clock-by-clock model, through the chip's API, for:
  *
  *   - a long run of advances of every size the hosts use (1..64, an NMI
@@ -990,6 +1111,8 @@ static void check_host_seam(void)
  * continue from, found by searching the table. */
 typedef struct {
     int l9[8], l17[8], swDelay, norsDelayed[3];
+    int prev_init;     /* mirrors c012294.c's rng_init_prev - see
+                         * ref_advance_lagged() below */
 } ref_chain;
 
 static void ref_step(ref_chain *s, int Init, int sel9bitPoly)
@@ -1021,11 +1144,36 @@ static void ref_reset(ref_chain *s)
 {
     memset(s, 0, sizeof *s);
     for (int i = 0; i < 17; i++) ref_step(s, 1, 0);
+    s->prev_init = 1;   /* chain_reset() leaves the real chip held, so
+                          * rng_init_prev starts at 1 too */
 }
 
 static void ref_advance(ref_chain *s, uint32_t n, int Init, int sel9)
 {
     while (n--) ref_step(s, Init, sel9);
+}
+
+/* This duplicate reference model has the same "Init takes effect
+ * immediately" assumption c012294.c's chain used to have, and needs the
+ * same fix for the same reason: ad_pokey_advance()'s rng_init_prev spends
+ * the first clock of an advance() on the PRE-write Init value whenever the
+ * two disagree (SKCTL's register and the chain move on the same edge, so
+ * the write's own edge still sees the old value - Altirra HRM ch.5,
+ * "Initialization behaviour").  check_chain() drives `chip` through
+ * ad_pokey_write()/ad_pokey_advance() and `r` through this reference in
+ * lockstep, so `r` must see the identical one-clock lag on every Init
+ * transition, tracked the same way via prev_init. */
+static void ref_advance_lagged(ref_chain *s, uint32_t n, int Init, int sel9)
+{
+    if (n && (s->prev_init != 0) != (Init != 0)) {
+        ref_step(s, s->prev_init, sel9);
+        s->prev_init = Init;
+        n--;
+    }
+    if (n) {
+        ref_advance(s, n, Init, sel9);
+        s->prev_init = Init;
+    }
 }
 
 static void check_chain(void)
@@ -1051,20 +1199,23 @@ static void check_chain(void)
               RESET_POS17, pos);
     }
 
-    /* Running: every advance size, both poly selects. */
+    /* Running: every advance size, both poly selects.  `chip` sees the
+     * SKCTL write's one-clock Init lag on the very first ad_pokey_advance()
+     * below (rng_init_prev); `r` must see the same lag on its first
+     * ref_advance_lagged() call, hence that call replacing plain
+     * ref_advance() here - see ref_advance_lagged()'s comment. */
     for (int sel = 0; sel < 2; sel++) {
         ad_pokey chip; ref_chain r;
         ad_pokey_init(&chip, 1512000, 44100);
         ref_reset(&r);
         if (sel) ad_pokey_write(&chip, W_AUDCTL, CTL_POLY9);
-        ref_advance(&r, 0, 1, sel);
         ad_pokey_write(&chip, W_SKCTL, 7);
         int bad = 0, total = 0;
         for (int pass = 0; pass < 6; pass++) {
             for (int i = 0; i < nsizes; i++) {
                 uint32_t n = sizes[i] + (uint32_t)pass;
                 ad_pokey_advance(&chip, n);
-                ref_advance(&r, n, 0, sel);
+                ref_advance_lagged(&r, n, 0, sel);
                 total++;
                 if (ad_pokey_read(&chip, R_RANDOM) != ref_random(&r)) bad++;
             }
@@ -1090,10 +1241,16 @@ static void check_chain(void)
                 ref_reset(&r);
                 if (sel) ad_pokey_write(&chip, W_AUDCTL, CTL_POLY9);
                 ad_pokey_write(&chip, W_SKCTL, 7);
-                ad_pokey_advance(&chip, 1000 + h * 97); ref_advance(&r, 1000 + h * 97, 0, sel);
+                /* Each of these three ad_pokey_advance()/read spans starts
+                 * right after an SKCTL write that flips Init, so each one's
+                 * first clock is where rng_init_prev's lag lands on `chip`;
+                 * ref_advance_lagged() replays the same lag on `r` (see its
+                 * comment) instead of the plain ref_advance()/ref_step()
+                 * this block used before the lag was added to c012294.c. */
+                ad_pokey_advance(&chip, 1000 + h * 97); ref_advance_lagged(&r, 1000 + h * 97, 0, sel);
                 ad_pokey_write(&chip, W_SKCTL, 0);
                 for (uint32_t c = 0; c < h; c++) {
-                    ad_pokey_advance(&chip, 1); ref_step(&r, 1, sel);
+                    ad_pokey_advance(&chip, 1); ref_advance_lagged(&r, 1, 1, sel);
                     if (ad_pokey_read(&chip, R_RANDOM) != ref_random(&r)) bad_hold++;
                 }
                 ad_pokey_write(&chip, W_SKCTL, 7);
@@ -1102,7 +1259,7 @@ static void check_chain(void)
                     uint8_t v = ad_pokey_read(&chip, R_RANDOM);
                     if (v != ref_random(&r)) bad_hold++;
                     if (sel == 0 && v != settled[c]) same_as_settled = false;
-                    ad_pokey_advance(&chip, 1); ref_step(&r, 0, sel);
+                    ad_pokey_advance(&chip, 1); ref_advance_lagged(&r, 1, 0, sel);
                 }
                 if (sel == 0) {
                     if (h < 17 && same_as_settled) bad_short++;
@@ -1146,17 +1303,23 @@ static void check_chain(void)
         ad_pokey_init(&chip, 1512000, 44100);
         ref_reset(&r);
         ad_pokey_write(&chip, W_SKCTL, 7);
+        /* SKCTL is only written once here (init release, before the flip
+         * loop); AUDCTL's poly-select flips inside the loop don't touch
+         * Init, so ref_advance_lagged() only actually absorbs a lag once
+         * (on the very first call below) and is a plain ref_advance() every
+         * other time - using it throughout is just the uniform, always-
+         * correct way to call it (see its comment). */
         int bad = 0;
         int sel = 0;
         for (int flip = 0; flip < 8; flip++) {
-            ad_pokey_advance(&chip, 777); ref_advance(&r, 777, 0, sel);
+            ad_pokey_advance(&chip, 777); ref_advance_lagged(&r, 777, 0, sel);
             sel ^= 1;
             ad_pokey_write(&chip, W_AUDCTL, sel ? CTL_POLY9 : 0);
             for (int c = 0; c < 40; c++) {
-                ad_pokey_advance(&chip, 1); ref_step(&r, 0, sel);
+                ad_pokey_advance(&chip, 1); ref_advance_lagged(&r, 1, 0, sel);
                 if (ad_pokey_read(&chip, R_RANDOM) != ref_random(&r)) bad++;
             }
-            ad_pokey_advance(&chip, 3001); ref_advance(&r, 3001, 0, sel);
+            ad_pokey_advance(&chip, 3001); ref_advance_lagged(&r, 3001, 0, sel);
             if (ad_pokey_read(&chip, R_RANDOM) != ref_random(&r)) bad++;
         }
         CHECK(bad == 0, "poly select flips: %d reads disagree with the reference", bad);

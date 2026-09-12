@@ -8,10 +8,12 @@
  *    divided by 12), and a main-line frame whenever the NMI has raised
  *    SYNC, which is every fourth interrupt - so the game runs at the
  *    board's 62.5 Hz, not the monitor's
- *  - RANDOM/ALLPOT come from a real POKEY (pokey.c) under this port's
- *    modelled clock (pokey.h).  Sound output: the POKEY is rendered and
- *    streamed to plat_audio_push every tick (render_push_audio() below),
- *    and the two discrete circuits - explosion, thrust - play as
+ *  - RANDOM/ALLPOT come from a real POKEY (c012294.c) under this port's
+ *    modelled clock (c012294.h).  Sound output: the chip generates its
+ *    audio from its own counters as machine time advances, and each NMI
+ *    period's worth is drained and streamed to plat_audio_push
+ *    (render_push_audio_tick() below); the two discrete circuits -
+ *    explosion, thrust - play as
  *    recorded samples through plat_sample_start/stop, the way the
  *    user's AAE driver plays them (asteroid_explode_w/astdelux_sounds_w
  *    in asteroid.cpp).
@@ -23,7 +25,7 @@
 #include <string.h>
 
 #include "astdelux.h"
-#include "pokey.h"
+#include "c012294.h"
 #include "er2055.h"
 #include "platform/ad_platform.h"
 
@@ -38,11 +40,15 @@ static double   nmi_ms = 4.0;           /* 1000 / (4 * frame rate) */
 static unsigned frame_hz10 = 625;       /* frame rate x 10, for exact audio arithmetic */
 #define AD_NMI_POKEY_CYCLES 6048        /* one NMI period at 1.512 MHz, whatever
                                          * its wall-clock length: underclocking */
+static uint32_t pokey_hz = 1512000;     /* the chip's clock as the stream hears it:
+                                         * AD_NMI_POKEY_CYCLES per NMI period, so
+                                         * 6048 * 4 * frame rate - 1.512 MHz at the
+                                         * board's 62.5 Hz, 1.45152 MHz at 60 */
 #define AD_RANDOM_READ_COST 64          /* POKEY cycles this host charges before each
                                          * game RANDOM read: a stand-in for the 6502
                                          * cycles the read and its neighbours take,
                                          * since there is no CPU to count them (the
-                                         * chip itself charges nothing - pokey.h) */
+                                         * chip itself charges nothing - c012294.h) */
 #define AD_MAINLINE_LEAD_CYCLES 512     /* POKEY cycles advanced before the main line
                                          * runs its frame: on the board the frame's
                                          * code runs for milliseconds after the NMI
@@ -65,9 +71,33 @@ static unsigned frames, nmis, dvg_errors;
 static bool test_mode;                      /* running the cabinet self-test */
 
 /* POKEY clock is the same 1.512 MHz as the 6502 (astdelux2_main.asm);
- * AD_AUDIO_RATE is the render/output rate, fed to both ad_pokey_init and
- * plat_audio_open so the render loop and the stream voice agree. */
+ * AD_AUDIO_RATE is the output rate, fed to both ad_pokey_init and
+ * plat_audio_open so the chip's sample clock and the stream voice agree.
+ *
+ * Every advance produces audio in the chip's queue, and the stream is
+ * drained one NMI period at a time, so machine time between NMIs - the
+ * main line's declared cycles, the lead before a frame, the RANDOM read
+ * charges - is deducted from the next NMI advances (pokey_spent) rather
+ * than added on top of them: the chip then runs exactly real time and the
+ * queue never grows.  On the board those cycles ARE inside the NMI
+ * period, so this is also the truer clock. */
 static ad_pokey pokey;
+static uint32_t pokey_spent;            /* cycles advanced since the last NMI budget */
+
+/* Advance the chip outside an NMI period, charging it against the next one. */
+static void pokey_charge(uint32_t cycles)
+{
+    ad_pokey_advance(&pokey, cycles);
+    pokey_spent += cycles;
+}
+
+/* Advance the chip by one NMI budget less what was already charged. */
+static void pokey_budget(uint32_t budget)
+{
+    uint32_t spent = pokey_spent < budget ? pokey_spent : budget;
+    pokey_spent -= spent;
+    ad_pokey_advance(&pokey, budget - spent);
+}
 
 /* The EAROM: high scores persist in `astdelux.nv` (plat_nvram_read/write,
  * platform/windows/plat_win.c), loaded once at start and saved whenever
@@ -77,35 +107,39 @@ static ad_er2055 earom;
 /* ------------------------------------------------------------------ */
 /* POKEY audio: render one tick's worth of samples and push them        */
 /* ------------------------------------------------------------------ */
-/* One NMI period of audio is AD_AUDIO_RATE / (4 * frame rate) frames:
- * 176.4 at 62.5 Hz, 183.75 at 60 Hz - not an integer - so a running
- * remainder in units of 1 / (4 * frame_hz10) carries the fractional
- * part across calls exactly: most ticks render the whole part, and
- * every few one more absorbs the accumulated remainder, so the long-run
- * output rate is exactly AD_AUDIO_RATE with no drift.
+/* One NMI period of audio is AD_AUDIO_RATE * AD_NMI_POKEY_CYCLES /
+ * pokey_hz frames: 176.4 at 62.5 Hz, 183.75 at 60 Hz - not an integer -
+ * so a running remainder in units of 1 / pokey_hz carries the fractional
+ * part across calls exactly, the same arithmetic the chip's own sample
+ * integrator uses, so the drain and the chip agree to the sample and the
+ * long-run output rate is exactly AD_AUDIO_RATE with no drift.
  *
  * Always called per NMI period, even from self-test: self-test's own
  * while loop advances machine time four periods at a pass because no
- * NMIs run there, but audio still renders one period at a time (four
+ * NMIs run there, but audio is still drained one period at a time (four
  * calls per pass) rather than one four-period block - that would
  * overrun mixer.h's STREAM_BLOCK_FRAMES (512), and splitting it keeps
- * both paths on the same rate-locked sequence out of one accumulator. */
-static uint32_t audio_frac;
+ * both paths on the same rate-locked sequence out of one accumulator.
+ * A short queue (which the budget above prevents) is padded with
+ * silence rather than stalling the stream. */
+static uint64_t audio_phase;
 static int16_t  audio_buf[256];         /* 220.5 frames at 50 Hz is the most */
 
 static void render_push_audio_tick(void)
 {
-    const uint32_t den = 4u * frame_hz10;
-    int frames_n;
+    int frames_n, got;
 
-    audio_frac += (uint32_t)AD_AUDIO_RATE * 10u;
-    frames_n = (int)(audio_frac / den);
-    audio_frac %= den;
+    audio_phase += (uint64_t)AD_AUDIO_RATE * AD_NMI_POKEY_CYCLES;
+    frames_n = (int)(audio_phase / pokey_hz);
+    audio_phase %= pokey_hz;
 
     if (frames_n > (int)(sizeof audio_buf / sizeof audio_buf[0]))
         frames_n = (int)(sizeof audio_buf / sizeof audio_buf[0]);   /* defensive */
+    if (frames_n <= 0) return;
 
-    ad_pokey_render(&pokey, audio_buf, frames_n);
+    got = ad_pokey_audio_read(&pokey, audio_buf, frames_n);
+    if (got < frames_n)
+        memset(audio_buf + got, 0, (size_t)(frames_n - got) * sizeof audio_buf[0]);
     plat_audio_push(audio_buf, frames_n);
 }
 
@@ -173,7 +207,7 @@ uint8_t ad_hw_rom_rev(void)
  * onto the POKEY clock. */
 void ad_hw_cycles(uint16_t cycles)
 {
-    ad_pokey_advance(&pokey, cycles);
+    pokey_charge(cycles);
 }
 
 /* Switch inputs by full 6502 address; bit 7 = pressed, as the board
@@ -201,17 +235,17 @@ uint8_t ad_hw_switch(uint16_t addr)
 }
 
 /* POKEY.  Register 8 (read) is ALLPOT: the coin DIP (OPTN5, dsw2 above)
- * is strapped to the pot pins, so pokey.c's pot-scan model answers it
+ * is strapped to the pot pins, so c012294.c's pot-scan model answers it
  * (see ad_pokey_set_allpot() in ad_app_init() below). */
 uint8_t ad_hw_pokey_read(uint8_t r)   { return ad_pokey_read(&pokey, r); }
 void    ad_hw_pokey_write(uint8_t r, uint8_t v) { ad_pokey_write(&pokey, r, v); }
 
-/* RANDOM, from the real POKEY polynomial (pokey.c).  The game's reads
+/* RANDOM, from the real POKEY polynomial (c012294.c).  The game's reads
  * are not cycle-annotated, so this host moves the chip a flat
- * AD_RANDOM_READ_COST before each one - see pokey.h's time model. */
+ * AD_RANDOM_READ_COST before each one - see c012294.h's time model. */
 uint8_t ad_hw_random(void)
 {
-    ad_pokey_advance(&pokey, AD_RANDOM_READ_COST);
+    pokey_charge(AD_RANDOM_READ_COST);
     return ad_pokey_read(&pokey, 0x0A);
 }
 
@@ -318,14 +352,18 @@ void ad_app_set_frame_rate(double hz)
     if (hz > 70.0) hz = 70.0;
     frame_hz10 = (unsigned)(hz * 10.0 + 0.5);
     nmi_ms = 1000.0 / (4.0 * (frame_hz10 / 10.0));
+    pokey_hz = (uint32_t)(4u * AD_NMI_POKEY_CYCLES) * frame_hz10 / 10u;
 }
 
 void ad_app_init(void)
 {
     /* Live before ad_pwron(), which writes SKCTL through
      * ad_hw_pokey_write() as PWRON does. */
-    ad_pokey_init(&pokey, 1512000, AD_AUDIO_RATE);
+    ad_pokey_init(&pokey, pokey_hz, AD_AUDIO_RATE);
+    ad_pokey_set_cycle_audio(&pokey, true);
     ad_pokey_set_allpot(&pokey, dsw2);
+    pokey_spent = 0;
+    audio_phase = 0;
 
     ad_er2055_init(&earom);
     ad_er2055_control(&earom, 0);    /* board reset (asteroid_m.cpp); the
@@ -409,10 +447,9 @@ double ad_app_step(double now_ms)
         while (acc >= 4.0 * nmi_ms) {
             int i;
             acc -= 4.0 * nmi_ms;
-            ad_pokey_advance(&pokey, 4 * AD_NMI_POKEY_CYCLES);  /* NMIs don't run
-                                                                  * in self-test,
-                                                                  * but time still
-                                                                  * passes */
+            pokey_budget(4 * AD_NMI_POKEY_CYCLES);   /* NMIs don't run in
+                                                      * self-test, but time
+                                                      * still passes */
             for (i = 0; i < 4; i++)
                 render_push_audio_tick(); /* one pass = four NMI periods of audio */
             if (!ad_stest_frame()) {
@@ -426,11 +463,12 @@ double ad_app_step(double now_ms)
         while (acc >= nmi_ms) {
             acc -= nmi_ms;
             nmis++;
-            ad_pokey_advance(&pokey, AD_NMI_POKEY_CYCLES);
+            pokey_budget(AD_NMI_POKEY_CYCLES);
             ad_nmi();
-            render_push_audio_tick();     /* after ad_nmi(): this tick's registers are set */
+            render_push_audio_tick();     /* drain the period the advance produced;
+                                           * ad_nmi()'s writes shape the next one */
             if (g.zp.f.SYNC & 1) {
-                ad_pokey_advance(&pokey, AD_MAINLINE_LEAD_CYCLES);
+                pokey_charge(AD_MAINLINE_LEAD_CYCLES);
                 if (!ad_frame())
                     ad_newast();                    /* START1: next wave */
                 fps_frames++;

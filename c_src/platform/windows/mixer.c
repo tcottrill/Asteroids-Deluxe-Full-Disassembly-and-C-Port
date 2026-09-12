@@ -796,6 +796,22 @@ typedef struct STREAM
 
 static STREAM g_stream;
 
+/* Stream health counters, read and reset by stream_stats(): pushes that
+ * found the voice already drained (a gap was just heard), forced flushes,
+ * and the queue depth seen at push time. */
+static struct {
+	unsigned pushes, starved, flushes, depth_min, depth_max, depth_sum;
+} g_sstat;
+
+void stream_stats(char *buf, size_t n)
+{
+	snprintf(buf, n, "stream: %u pushes, %u starved, %u flushed, depth %u..%u avg %.1f",
+	         g_sstat.pushes, g_sstat.starved, g_sstat.flushes,
+	         g_sstat.pushes ? g_sstat.depth_min : 0, g_sstat.depth_max,
+	         g_sstat.pushes ? (double)g_sstat.depth_sum / g_sstat.pushes : 0.0);
+	memset(&g_sstat, 0, sizeof g_sstat);
+}
+
 int stream_open(int sample_rate, int channels)
 {
 	WAVEFORMATEX fx;
@@ -839,6 +855,32 @@ int stream_open(int sample_rate, int channels)
 	return 0;
 }
 
+/* Queue STREAM_PRIME_BLOCKS blocks of silence, each `frames` long, ahead
+ * of the caller's audio.  The producer feeds one ~4 ms block per IRQ tick
+ * and XAudio2 drains at exactly that rate, so the queue depth never grows
+ * on its own: whatever is queued when the voice starts is the whole margin
+ * against a late push, and one starved quantum is an audible gap.  Three
+ * blocks (~12 ms) cover the frame-length hitches seen in practice at the
+ * cost of 12 ms of latency; done at voice start and again after a flush,
+ * which empties the queue the same way. */
+#define STREAM_PRIME_BLOCKS 3
+
+static void stream_prime(int frames)
+{
+	int i;
+	for (i = 0; i < STREAM_PRIME_BLOCKS; i++) {
+		XAUDIO2_BUFFER buf;
+		int16_t *slot = g_stream.ring[g_stream.next_slot];
+		g_stream.next_slot = (g_stream.next_slot + 1) % STREAM_SLOTS;
+		memset(slot, 0, (size_t)frames * g_stream.channels * sizeof(int16_t));
+		memset(&buf, 0, sizeof buf);
+		buf.AudioBytes = (UINT32)(frames * g_stream.channels * (int)sizeof(int16_t));
+		buf.pAudioData = (const BYTE *)slot;
+		XA2_CHECK(IXAudio2SourceVoice_SubmitSourceBuffer(g_stream.voice, &buf, NULL),
+		          "SubmitSourceBuffer (stream prime)");
+	}
+}
+
 void stream_push(const int16_t *pcm, int frames)
 {
 	XAUDIO2_VOICE_STATE state;
@@ -850,7 +892,14 @@ void stream_push(const int16_t *pcm, int frames)
 	if (frames > STREAM_BLOCK_FRAMES) frames = STREAM_BLOCK_FRAMES;
 
 	IXAudio2SourceVoice_GetState(g_stream.voice, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+	if (g_sstat.pushes == 0 || state.BuffersQueued < g_sstat.depth_min)
+		g_sstat.depth_min = state.BuffersQueued;
+	if (state.BuffersQueued > g_sstat.depth_max) g_sstat.depth_max = state.BuffersQueued;
+	g_sstat.depth_sum += state.BuffersQueued;
+	g_sstat.pushes++;
+	if (g_stream.started && state.BuffersQueued == 0) g_sstat.starved++;
 	if (state.BuffersQueued >= STREAM_SLOTS - 1) {
+		g_sstat.flushes++;
 		/* The caller has fallen behind. XAudio2 reads each queued buffer
 		   from the ring slot it was submitted from, so a queue deeper than
 		   the ring would have the next push overwrite a slot XAudio2 still
@@ -859,7 +908,10 @@ void stream_push(const int16_t *pcm, int frames)
 		   backlog goes; a short gap beats a stretch of stale audio. */
 		XA2_CHECK(IXAudio2SourceVoice_FlushSourceBuffers(g_stream.voice),
 		          "FlushSourceBuffers (stream overflow)");
+		stream_prime(frames);
 	}
+	if (!g_stream.started)
+		stream_prime(frames);
 
 	slot = g_stream.ring[g_stream.next_slot];
 	g_stream.next_slot = (g_stream.next_slot + 1) % STREAM_SLOTS;

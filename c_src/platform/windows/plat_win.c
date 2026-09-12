@@ -739,7 +739,7 @@ void plat_sample_stop(int channel)
 
 int plat_audio_open(int sample_rate)
 {
-    return stream_open(sample_rate, 1);      /* mono, matches ad_pokey_render */
+    return stream_open(sample_rate, 1);      /* mono, matches the chip's drained output */
 }
 
 void plat_audio_push(const int16_t* pcm, int frames)
@@ -802,6 +802,13 @@ void plat_status_text(const char* s)
              "Left/Right rotate, Ctrl fire, Up/Alt thrust, "
              "Space shield, 5 coin, 1 start, F2 self-test, Esc quit", s);
     set_window_title(buf);
+    /* The stream's health for the same second, to the log: pushes that
+     * found the voice drained, forced flushes, queue depth. */
+    {
+        char st[160];
+        stream_stats(st, sizeof st);
+        LOG_INFO("%s | %s", s, st);
+    }
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,

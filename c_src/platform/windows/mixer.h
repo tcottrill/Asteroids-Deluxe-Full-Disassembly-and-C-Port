@@ -161,6 +161,11 @@ int  stream_open(int sample_rate, int channels);
    opened. */
 void stream_push(const int16_t *pcm, int frames);
 
+/* Formats the stream's health counters since the previous call into buf
+   (pushes, pushes that found the voice drained, forced flushes, queue
+   depth range) and resets them. */
+void stream_stats(char *buf, size_t n);
+
 /* Stops and destroys the stream voice. Safe to call when not open. */
 void stream_close(void);
 
